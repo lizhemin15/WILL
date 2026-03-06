@@ -101,6 +101,7 @@ func handleSetup(s *store.Store) http.HandlerFunc {
 			http.Error(w, "invalid form", http.StatusBadRequest)
 			return
 		}
+		
 		set := func(key, v string) {
 			v = strings.TrimSpace(v)
 			if v != "" {
