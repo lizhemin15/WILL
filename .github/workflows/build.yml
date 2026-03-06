@@ -1,0 +1,75 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          BIN=will
+          [ "${{ matrix.goos }}" = "windows" ] && BIN=will.exe
+          go build -ldflags="-s -w" -o "dist/${{ matrix.goos }}-${{ matrix.goarch }}/$BIN" ./cmd/will
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: will-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ matrix.goos }}-${{ matrix.goarch }}/
+
+  pack:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Pack all-platform archive
+        run: |
+          mkdir -p release
+          for d in artifacts/will-*; do
+            name=$(basename "$d" | sed 's/^will-/will-/')
+            (cd "$d" && zip -r "../../release/${name}.zip" .)
+          done
+          (cd release && zip -r ../will-all-platforms.zip .)
+
+      - name: Upload all-platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: will-all-platforms
+          path: will-all-platforms.zip
