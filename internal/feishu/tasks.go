@@ -22,6 +22,46 @@ type TaskInfo struct {
 	Done  bool
 }
 
+// ListTasks 获取所有飞书任务（分页拉取，最多 500 条）
+func ListTasks() ([]TaskInfo, error) {
+	cli := getClient()
+	if cli == nil {
+		return nil, fmt.Errorf("feishu client not initialized")
+	}
+	var result []TaskInfo
+	var pageToken string
+	for {
+		builder := larktask.NewListTaskReqBuilder().
+			UserIdType("open_id").
+			PageSize(100)
+		if pageToken != "" {
+			builder = builder.PageToken(pageToken)
+		}
+		resp, err := cli.Task.V1.Task.List(context.Background(), builder.Build())
+		if err != nil {
+			return nil, fmt.Errorf("拉取飞书任务列表失败: %w", err)
+		}
+		if !resp.Success() {
+			return nil, fmt.Errorf("code=%d msg=%s", resp.Code, resp.Msg)
+		}
+		for _, t := range resp.Data.Items {
+			if t.Id == nil || t.Summary == nil {
+				continue
+			}
+			info := TaskInfo{ID: *t.Id, Title: *t.Summary}
+			if t.CompleteTime != nil && *t.CompleteTime != "" && *t.CompleteTime != "0" {
+				info.Done = true
+			}
+			result = append(result, info)
+		}
+		if resp.Data.HasMore == nil || !*resp.Data.HasMore || resp.Data.PageToken == nil || len(result) >= 500 {
+			break
+		}
+		pageToken = *resp.Data.PageToken
+	}
+	return result, nil
+}
+
 // CreateTask 在飞书任务中心创建一条任务，将 openID 用户设为执行者，返回飞书任务 ID
 func CreateTask(openID, title string) (string, error) {
 	cli := getClient()

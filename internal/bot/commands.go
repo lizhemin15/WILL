@@ -233,9 +233,9 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 	}
 	// /todo 或 /todo list：列出待办（序号从 1 开始）
 	if len(args) == 0 || (len(args) >= 1 && strings.ToLower(strings.TrimSpace(args[0])) == "list") {
-		list, err := s.ListTodos(openID)
+		list, err := feishu.ListTasks()
 		if err != nil {
-			return "读取待办失败: " + err.Error()
+			return "获取飞书任务失败: " + err.Error()
 		}
 		if len(list) == 0 {
 			return "当前无待办。发送 /todo add <内容> 添加。"
@@ -244,7 +244,7 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		b.WriteString("待办列表：\n")
 		for i, t := range list {
 			status := "未完成"
-			if t.Status == "done" {
+			if t.Done {
 				status = "已完成"
 			}
 			b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", i+1, t.Title, status))
@@ -262,37 +262,25 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if title == "" {
 			return "待办内容不能为空。"
 		}
-		localID, err := s.AddTodo(openID, title)
-		if err != nil {
-			return "添加失败: " + err.Error()
+		if _, err := feishu.CreateTask(openID, title); err != nil {
+			return "创建失败: " + err.Error()
 		}
-		syncNote := "（飞书同步失败，请确认应用已开启 task:task 权限）"
-		if taskID, ferr := feishu.CreateTask(openID, title); ferr == nil && taskID != "" {
-			_ = s.SetFeishuTaskID(localID, taskID)
-			syncNote = "（已同步至飞书任务中心）"
-		} else if ferr != nil {
-			log.Printf("[todo] 创建飞书任务失败: %v", ferr)
-			syncNote = fmt.Sprintf("（飞书同步失败: %v）", ferr)
-		}
-		return fmt.Sprintf("已添加待办 [%d] %s %s", localID, title, syncNote)
+		return "已添加待办：" + title
 	case "done":
 		if len(args) < 2 {
 			return "用法: /todo done <序号> 或 /todo done 1 2 3"
 		}
-		list, err := s.ListTodos(openID)
+		list, err := feishu.ListTasks()
 		if err != nil {
-			return "读取待办失败: " + err.Error()
+			return "获取飞书任务失败: " + err.Error()
 		}
-		ids, indices := resolveTodoIndices(list, args[1:])
-		if len(ids) == 0 {
+		taskIDs, indices := resolveTodoIndices(list, args[1:])
+		if len(taskIDs) == 0 {
 			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-		for i, id := range ids {
-			_, _ = s.SetTodoStatus(id, openID, "done")
-			if list[indices[i]-1].FeishuTaskID != "" {
-				if ferr := feishu.CompleteTask(list[indices[i]-1].FeishuTaskID); ferr != nil {
-					log.Printf("[todo] 完成飞书任务失败: %v", ferr)
-				}
+		for _, tid := range taskIDs {
+			if ferr := feishu.CompleteTask(tid); ferr != nil {
+				log.Printf("[todo] 完成飞书任务 %s 失败: %v", tid, ferr)
 			}
 		}
 		return fmt.Sprintf("已将 %s 标为已完成。", formatTodoIndices(indices))
@@ -300,39 +288,27 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if len(args) < 2 {
 			return "用法: /todo delete <序号> 或 /todo delete 1 2 3"
 		}
-		list, err := s.ListTodos(openID)
+		list, err := feishu.ListTasks()
 		if err != nil {
-			return "读取待办失败: " + err.Error()
+			return "获取飞书任务失败: " + err.Error()
 		}
-		ids, indices := resolveTodoIndices(list, args[1:])
-		if len(ids) == 0 {
+		taskIDs, indices := resolveTodoIndices(list, args[1:])
+		if len(taskIDs) == 0 {
 			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-	var feishuErrs []string
-	for i, id := range ids {
-		_, _ = s.DeleteTodo(id, openID)
-		taskID := list[indices[i]-1].FeishuTaskID
-		if taskID != "" {
-			if ferr := feishu.DeleteTask(taskID); ferr != nil {
-				log.Printf("[todo] 删除飞书任务 %s 失败: %v", taskID, ferr)
-				feishuErrs = append(feishuErrs, ferr.Error())
+		for _, tid := range taskIDs {
+			if ferr := feishu.DeleteTask(tid); ferr != nil {
+				log.Printf("[todo] 删除飞书任务 %s 失败: %v", tid, ferr)
 			}
-		} else {
-			feishuErrs = append(feishuErrs, "该待办未绑定飞书任务ID")
 		}
-	}
-	result := fmt.Sprintf("已删除待办 %s。", formatTodoIndices(indices))
-	if len(feishuErrs) > 0 {
-		result += "（飞书同步: " + strings.Join(feishuErrs, "; ") + "）"
-	}
-	return result
+		return fmt.Sprintf("已删除待办 %s。", formatTodoIndices(indices))
 	default:
 		return "用法: /todo [list|add <内容>|done 1 2|delete 1 2]"
 	}
 }
 
-// resolveTodoIndices 将参数（如 ["1", "2"] 或 ["1,2,3"]）解析为待办 id 与序号；list 为当前列表，序号从 1 开始
-func resolveTodoIndices(list []store.Todo, args []string) (ids []int64, indices []int) {
+// resolveTodoIndices 将参数（如 ["1", "2"] 或 ["1,2,3"]）解析为飞书任务 ID 与序号；list 为当前列表，序号从 1 开始
+func resolveTodoIndices(list []feishu.TaskInfo, args []string) (taskIDs []string, indices []int) {
 	seen := make(map[int]bool)
 	for _, a := range args {
 		for _, p := range strings.FieldsFunc(a, func(r rune) bool { return r == ',' || r == '，' || r == '、' }) {
@@ -342,11 +318,11 @@ func resolveTodoIndices(list []store.Todo, args []string) (ids []int64, indices 
 				continue
 			}
 			seen[n] = true
-			ids = append(ids, list[n-1].ID)
+			taskIDs = append(taskIDs, list[n-1].ID)
 			indices = append(indices, n)
 		}
 	}
-	return ids, indices
+	return taskIDs, indices
 }
 
 // cmdStatus 展示当前会话状态（参考 OpenClaw /status）
@@ -363,10 +339,10 @@ func cmdStatus(openID string, s *store.Store, cfg *config.Config) string {
 	var convCount, todoTotal, todoPending, schedCount, memCount int
 	if s != nil {
 		convCount = s.ConversationCount(openID)
-		if todos, err := s.ListTodos(openID); err == nil {
+		if todos, err := feishu.ListTasks(); err == nil {
 			todoTotal = len(todos)
 			for _, t := range todos {
-				if t.Status != "done" {
+				if !t.Done {
 					todoPending++
 				}
 			}

@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/yourusername/will/internal/config"
+	"github.com/yourusername/will/internal/feishu"
 	"github.com/yourusername/will/internal/store"
 )
 
@@ -285,14 +286,15 @@ func CallForInstruction(cfg *config.Config, scope, instruction string, s *store.
 
 	if s != nil {
 		openID := strings.TrimPrefix(scope, "user:")
-		todos, _ := s.ListTodos(openID)
+		_ = openID
+		todos, _ := feishu.ListTasks()
 		ctxBuf.WriteString("\n【当前待办列表】\n")
 		if len(todos) == 0 {
 			ctxBuf.WriteString("（无待办）\n")
 		} else {
 			for i, t := range todos {
 				status := "未完成"
-				if t.Status == "done" {
+				if t.Done {
 					status = "已完成"
 				}
 				ctxBuf.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, t.Title, status))
