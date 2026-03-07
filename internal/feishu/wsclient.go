@@ -6,7 +6,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/larksuite/oapi-sdk-go/v3/core"
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	"github.com/larksuite/oapi-sdk-go/v3/ws"
@@ -37,7 +37,7 @@ func StartWSClient(appID, appSecret string, onMessage ProcessMessageFunc) {
 		})
 	cli := ws.NewClient(appID, appSecret,
 		ws.WithEventHandler(eventHandler),
-		ws.WithLogLevel(core.LogLevelError),
+		ws.WithLogLevel(larkcore.LogLevelError),
 	)
 	log.Printf("WILL: 飞书长连接启动中…")
 	if err := cli.Start(context.Background()); err != nil {
