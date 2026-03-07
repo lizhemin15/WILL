@@ -38,10 +38,12 @@ type Response struct {
 	TodoTitle string            `json:"todo_title"`
 	TodoID    string            `json:"todo_id"`
 	// 定时任务：schedule_list / schedule_add / schedule_delete / schedule_update
-	ScheduleInstruction string `json:"schedule_instruction"` // 任务内容（可含：先查待办、查对话、搜最新信息等）
-	ScheduleRunAt       string `json:"schedule_run_at"`      // 执行时间：ISO 如 2025-03-07T09:00:00，或每日时间 09:00
-	ScheduleRepeat      string `json:"schedule_repeat"`       // "daily" 或空
-	ScheduleID          string `json:"schedule_id"`           // schedule_delete/update 时填任务 id（数字字符串）
+	ScheduleInstruction  string `json:"schedule_instruction"`   // 任务内容
+	ScheduleRunAt        string `json:"schedule_run_at"`         // 单个时间（daily/hourly/单次）
+	ScheduleRunAtList    string `json:"schedule_run_at_list"`    // 多个每日时间，逗号分隔如 "06:00,11:30,17:30"
+	ScheduleRepeat       string `json:"schedule_repeat"`          // "daily" | "hourly" | "interval" | ""
+	ScheduleIntervalMins string `json:"schedule_interval_mins"`  // repeat="interval" 时填间隔分钟数，如 "270"（4.5小时）
+	ScheduleID           string `json:"schedule_id"`              // schedule_delete/update 时填任务 id
 	Config    map[string]string `json:"config"`
 	Memory    map[string]string `json:"memory"`
 	Command   string            `json:"command"`
@@ -143,21 +145,23 @@ func Call(cfg *config.Config, userScope string, userMessage string, s *store.Sto
 		model = "gpt-4o-mini"
 	}
 
-	sys := `你是 WILL 的助手。请先根据用户消息判断意图，再填对应字段。必须用纯 JSON 回复，只包含一个 JSON 对象，不要其他文字。
+	sys := `你是 WILL，运行在飞书上的个人助手。能力仅限：待办管理、定时任务、版本检查、普通对话/记忆、执行 shell 命令。不能访问外部网站、发邮件、接入第三方平台。
 
-意图 intent 取值（只能填其中一个，否则留空）：
-- todo_list：查看待办列表。todo_add 必填 todo_title。todo_done / todo_delete 必填 todo_id：为列表中序号（从1开始），多条用逗号分隔如 "1,2,3"
-- version_check：检查程序新版本
-- schedule_list：用户要查看自己的定时任务列表
-- schedule_add：用户要添加定时任务，必填 schedule_instruction（任务说明，如：先查待办再搜今日科技新闻）、schedule_run_at（执行时间，ISO 如 2025-03-07T09:00:00 或每日时间 09:00）、schedule_repeat（填 "daily" 或空）
-- schedule_delete：用户要删除某条定时任务，必填 schedule_id（任务 id 数字字符串）
-- schedule_update：用户要修改某条定时任务，必填 schedule_id，以及要改的 schedule_instruction / schedule_run_at / schedule_repeat
-- 留空或 chat：其他情况（执行命令、改配置、记记忆、普通对话）
+定时任务（schedule_add）字段说明：
+- schedule_instruction：执行时系统会注入最新待办和对话，只需描述角色和任务，如「作为严厉导师，基于当前待办和对话，给出下一步建议」
+- schedule_repeat："daily"（每天固定时间）| "hourly"（每小时）| "interval"（按间隔分钟数）| ""（单次）
+- schedule_run_at：单个时间，daily 填 "09:00"，hourly/interval 可留空，单次填 ISO 如 "2025-03-07T09:00"
+- schedule_run_at_list：多个每日时间，逗号分隔如 "06:00,11:30,17:30,21:00"（用户指定多个时间点时填此字段，同时 schedule_repeat="daily"）
+- schedule_interval_mins：repeat="interval" 时填间隔分钟数，如 "270"（4.5小时）、"240"（4小时）
 
-JSON 格式（未用到的字段填空字符串或空对象）：
-{"intent": "上述之一或空", "todo_title": "", "todo_id": "", "schedule_instruction": "", "schedule_run_at": "", "schedule_repeat": "", "schedule_id": "", "config": {}, "memory": {}, "command": "", "reply": ""}
+示例：用户说「每天6点和21点提醒」→ schedule_repeat="daily", schedule_run_at_list="06:00,21:00"
+示例：用户说「每隔4-5小时」→ schedule_repeat="interval", schedule_interval_mins="270"
 
-说明：config 的 key 仅限 feishu_app_id, feishu_app_secret, mode, internal_token, worker_urls, port, bind, llm_api_key, llm_base_url, llm_model。不要用 git 检查版本，用户说检查更新时 intent 填 version_check。定时任务内容可包含：查对话记录、查待办、搜索最新信息等。`
+必须用纯 JSON 回复（不要其他文字）：
+{"intent":"", "todo_title":"", "todo_id":"", "schedule_instruction":"", "schedule_run_at":"", "schedule_run_at_list":"", "schedule_repeat":"", "schedule_interval_mins":"", "schedule_id":"", "config":{}, "memory":{}, "command":"", "reply":""}
+
+意图：todo_list/todo_add/todo_done/todo_delete/version_check/schedule_list/schedule_add/schedule_update/schedule_delete/空
+config key 仅限：feishu_app_id, feishu_app_secret, llm_api_key, llm_base_url, llm_model, mode, port, bind, internal_token, worker_urls`
 
 	if s != nil {
 		mem, err := s.ListMemory(userScope)
@@ -268,7 +272,7 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 	return out, nil
 }
 
-// CallForInstruction 执行一条指令并返回纯文本回复（用于定时任务等）；若指令涉及搜索最新信息则自动使用搜索模型
+// CallForInstruction 执行定时任务指令：把实际待办列表和近期对话注入上下文，再由 LLM 分析并输出结论
 func CallForInstruction(cfg *config.Config, userScope string, instruction string, s *store.Store) (string, error) {
 	if cfg == nil || cfg.LLMApiKey == "" {
 		return "", fmt.Errorf("未配置 LLM")
@@ -278,9 +282,40 @@ func CallForInstruction(cfg *config.Config, userScope string, instruction string
 	if model == "" {
 		model = "gpt-4o-mini"
 	}
-	sys := "你是执行定时任务的助手。请根据用户指令执行（可结合对话记录、待办、或搜索最新信息），然后给出简洁汇总回复。只输出结果内容，不要 JSON。"
-	messages := []map[string]string{{"role": "system", "content": sys}}
+
+	// 构建上下文：从数据库拉取实际数据注入 system prompt，LLM 直接分析而非去"获取"
+	var ctxBuf strings.Builder
+	ctxBuf.WriteString("你是一个助手，正在自动执行定时任务。下方已提供所有相关数据，直接基于这些数据执行指令并输出简洁结论。不要 JSON，只输出给用户看的文字。\n")
+
 	if s != nil {
+		openID := strings.TrimPrefix(userScope, "user:")
+		// 注入待办列表
+		todos, err := s.ListTodos(openID)
+		if err == nil && len(todos) > 0 {
+			ctxBuf.WriteString("\n【当前待办列表】\n")
+			for i, t := range todos {
+				status := "未完成"
+				if t.Status == "done" {
+					status = "已完成"
+				}
+				ctxBuf.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, t.Title, status))
+			}
+		} else {
+			ctxBuf.WriteString("\n【当前待办列表】暂无待办。\n")
+		}
+		// 注入近期对话
+		history, err := s.GetRecentConversation(openID, maxHistoryMessages)
+		if err == nil && len(history) > 0 {
+			ctxBuf.WriteString("\n【近期对话记录】\n")
+			for _, m := range history {
+				role := "用户"
+				if m.Role == "assistant" {
+					role = "助手"
+				}
+				ctxBuf.WriteString(role + ": " + truncateRunes(m.Content, maxHistoryRunes) + "\n")
+			}
+		}
+		// 注入用户记忆
 		mem, err := s.ListMemory(userScope)
 		if err == nil && len(mem) > 0 {
 			keys := make([]string, 0, len(mem))
@@ -288,22 +323,18 @@ func CallForInstruction(cfg *config.Config, userScope string, instruction string
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
-			var lines []string
+			ctxBuf.WriteString("\n【用户记忆】\n")
 			for _, k := range keys {
-				lines = append(lines, k+": "+mem[k])
-			}
-			sys += "\n\n当前用户记忆：\n" + strings.Join(lines, "\n")
-			messages[0]["content"] = sys
-		}
-		openID := strings.TrimPrefix(userScope, "user:")
-		history, err := s.GetRecentConversation(openID, maxHistoryMessages)
-		if err == nil && len(history) > 0 {
-			for _, m := range history {
-				messages = append(messages, map[string]string{"role": m.Role, "content": truncateRunes(m.Content, maxHistoryRunes)})
+				ctxBuf.WriteString(k + ": " + mem[k] + "\n")
 			}
 		}
 	}
-	messages = append(messages, map[string]string{"role": "user", "content": instruction})
+
+	sys := ctxBuf.String()
+	messages := []map[string]string{
+		{"role": "system", "content": sys},
+		{"role": "user", "content": instruction},
+	}
 	body := map[string]interface{}{"model": model, "messages": messages, "max_tokens": 1024}
 	bodyBytes, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))

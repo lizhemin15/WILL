@@ -249,15 +249,20 @@ func (s *Store) DeleteScheduledTask(id int64) error {
 
 // UserScheduledPayload 用户定时任务 payload
 type UserScheduledPayload struct {
-	Instruction string `json:"instruction"`
-	Repeat     string `json:"repeat"` // "daily" | ""
+	Instruction     string `json:"instruction"`
+	Repeat          string `json:"repeat"`           // "daily" | "hourly" | "interval" | ""
+	IntervalMinutes int    `json:"interval_minutes"` // repeat="interval" 时有效，单位分钟
 }
 
 const KindUserScheduled = "user_scheduled"
 
-// AddUserScheduledTask 添加用户定时任务，返回任务 id
-func (s *Store) AddUserScheduledTask(openID, instruction string, runAt int64, repeat string) (int64, error) {
-	payload := UserScheduledPayload{Instruction: instruction, Repeat: repeat}
+// AddUserScheduledTask 添加用户定时任务，返回任务 id；intervalMinutes 仅 repeat="interval" 时有效
+func (s *Store) AddUserScheduledTask(openID, instruction string, runAt int64, repeat string, intervalMinutes ...int) (int64, error) {
+	p := UserScheduledPayload{Instruction: instruction, Repeat: repeat}
+	if len(intervalMinutes) > 0 {
+		p.IntervalMinutes = intervalMinutes[0]
+	}
+	payload := p
 	payloadBytes, _ := json.Marshal(payload)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -274,10 +279,11 @@ func (s *Store) AddUserScheduledTask(openID, instruction string, runAt int64, re
 
 // UserScheduledTask 用户定时任务列表项
 type UserScheduledTask struct {
-	ID          int64
-	Instruction string
-	Repeat      string
-	RunAt       int64
+	ID              int64
+	Instruction     string
+	Repeat          string
+	IntervalMinutes int
+	RunAt           int64
 }
 
 func (s *Store) ListUserScheduledTasks(openID string) ([]UserScheduledTask, error) {
@@ -301,7 +307,7 @@ func (s *Store) ListUserScheduledTasks(openID string) ([]UserScheduledTask, erro
 		}
 		var p UserScheduledPayload
 		_ = json.Unmarshal([]byte(payload), &p)
-		out = append(out, UserScheduledTask{ID: id, Instruction: p.Instruction, Repeat: p.Repeat, RunAt: runAt})
+		out = append(out, UserScheduledTask{ID: id, Instruction: p.Instruction, Repeat: p.Repeat, IntervalMinutes: p.IntervalMinutes, RunAt: runAt})
 	}
 	return out, rows.Err()
 }

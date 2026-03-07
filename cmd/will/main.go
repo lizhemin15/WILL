@@ -456,12 +456,20 @@ func runScheduledTasks(s *store.Store) {
 					reply = "定时任务执行失败: " + err.Error()
 				}
 				if cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
-					_ = feishu.SendMessageToUser(t.OpenID, "定时任务结果：\n"+reply)
+					_ = feishu.SendMessageToUser(t.OpenID, reply)
 				}
-				if p.Repeat == "daily" {
-					nextRunAt := t.RunAt + 24*3600
-					_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, nextRunAt, "daily")
+			switch p.Repeat {
+			case "daily":
+				_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, t.RunAt+24*3600, "daily")
+			case "hourly":
+				_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, t.RunAt+3600, "hourly")
+			case "interval":
+				mins := p.IntervalMinutes
+				if mins <= 0 {
+					mins = 60
 				}
+				_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, t.RunAt+int64(mins*60), "interval", mins)
+			}
 			}
 		}
 	}
@@ -480,30 +488,40 @@ func runMultiAgent(s *store.Store, cfg *config.Config, openID string, userMessag
 
 // isMultiStepRequest 判断消息是否包含多步操作的信号词，避免简单问题走多智能体
 func isMultiStepRequest(text string) bool {
-	text = strings.ToLower(strings.TrimSpace(text))
-	if text == "" {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
 		return false
 	}
+	// 以下模式是单一操作，不触发多智能体，无论含多少个动词
+	singleOpPatterns := []string{
+		"定时任务", "添加定时", "创建定时", "设置定时", "加个定时",
+		"待办", "新建待办", "添加待办",
+		"检查更新", "查看版本",
+	}
+	for _, p := range singleOpPatterns {
+		if strings.Contains(lower, p) {
+			return false
+		}
+	}
 	signals := []string{
-		"然后", "再", "接着", "之后", "同时", "并且", "另外", "还要", "还需", "还有",
-		"先…再", "先…然后", "第一", "第二", "步骤",
+		"然后", "接着", "之后", "同时", "并且", "另外", "还要", "还需",
 		"，再", "，然后", "，接着", "，同时",
+		"第一步", "第二步", "步骤",
 	}
 	count := 0
 	for _, s := range signals {
-		if strings.Contains(text, s) {
+		if strings.Contains(lower, s) {
 			count++
 			if count >= 2 {
 				return true
 			}
 		}
 	}
-	// 包含顿号/逗号分隔的多个操作动词（粗判）
-	hasVerb := func(v string) bool { return strings.Contains(text, v) }
-	actionVerbs := []string{"添加", "删除", "完成", "查看", "检查", "修改", "列出", "搜索", "帮我"}
+	// 包含多个独立操作动词（每个动词前后有边界感）才算多步
+	actionVerbs := []string{"删除", "完成", "检查", "修改", "列出", "搜索"}
 	verbCount := 0
 	for _, v := range actionVerbs {
-		if hasVerb(v) {
+		if strings.Contains(lower, v) {
 			verbCount++
 		}
 	}
@@ -572,15 +590,66 @@ func runWithLLM(s *store.Store, cfg *config.Config, openID string, userMessage s
 			if instruction == "" {
 				return "未识别到任务内容，请说明要定时做什么，如：每天9点先查待办再搜今日科技新闻"
 			}
-			runAt, err := parseScheduleRunAt(strings.TrimSpace(resp.ScheduleRunAt), strings.TrimSpace(strings.ToLower(resp.ScheduleRepeat)))
+			repeat := strings.TrimSpace(strings.ToLower(resp.ScheduleRepeat))
+			// 多时间点（schedule_run_at_list 非空）：批量创建每日定时任务
+			if runAtList := strings.TrimSpace(resp.ScheduleRunAtList); runAtList != "" {
+				parts := strings.FieldsFunc(runAtList, func(r rune) bool { return r == ',' || r == '，' || r == ' ' })
+				var addedTimes []string
+				for _, p := range parts {
+					p = strings.TrimSpace(p)
+					if p == "" {
+						continue
+					}
+					ts, err := parseDailyTime(p)
+					if err != nil {
+						continue
+					}
+					id, err := s.AddUserScheduledTask(openID, instruction, ts, "daily")
+					if err == nil {
+						addedTimes = append(addedTimes, fmt.Sprintf("[%d]%s", id, time.Unix(ts, 0).Format("15:04")))
+					}
+				}
+				if len(addedTimes) == 0 {
+					return "时间解析失败，请说明具体时间，如：06:00,11:30,17:30"
+				}
+				return "已添加 " + strconv.Itoa(len(addedTimes)) + " 个每日定时任务：" + strings.Join(addedTimes, " ")
+			}
+			// interval 间隔任务
+			if repeat == "interval" {
+				mins := 0
+				if minsStr := strings.TrimSpace(resp.ScheduleIntervalMins); minsStr != "" {
+					mins, _ = strconv.Atoi(minsStr)
+				}
+				if mins <= 0 {
+					mins = 60
+				}
+				runAt, _ := parseScheduleRunAt("", "interval", mins)
+				id, err := s.AddUserScheduledTask(openID, instruction, runAt, "interval", mins)
+				if err != nil {
+					return "添加定时任务失败: " + err.Error()
+				}
+				h, m := mins/60, mins%60
+				label := ""
+				if h > 0 && m > 0 {
+					label = fmt.Sprintf("每%d小时%d分钟", h, m)
+				} else if h > 0 {
+					label = fmt.Sprintf("每%d小时", h)
+				} else {
+					label = fmt.Sprintf("每%d分钟", mins)
+				}
+				return fmt.Sprintf("已添加定时任务 [%d]，%s执行，首次 %s。", id, label, time.Unix(runAt, 0).Format("15:04"))
+			}
+			// 单时间（hourly / daily / 单次）
+			runAt, err := parseScheduleRunAt(strings.TrimSpace(resp.ScheduleRunAt), repeat)
 			if err != nil {
 				return "时间解析失败，请说明具体时间，如：明天9点、每天09:00 — " + err.Error()
 			}
-			repeat := ""
-			if strings.TrimSpace(strings.ToLower(resp.ScheduleRepeat)) == "daily" {
-				repeat = "daily"
+			finalRepeat := ""
+			switch repeat {
+			case "daily", "hourly":
+				finalRepeat = repeat
 			}
-			id, err := s.AddUserScheduledTask(openID, instruction, runAt, repeat)
+			id, err := s.AddUserScheduledTask(openID, instruction, runAt, finalRepeat)
 			if err != nil {
 				return "添加定时任务失败: " + err.Error()
 			}
@@ -750,9 +819,24 @@ func formatScheduleList(list []store.UserScheduledTask) string {
 	var b strings.Builder
 	b.WriteString("定时任务列表：\n")
 	for _, t := range list {
-		when := time.Unix(t.RunAt, 0).Format("2006-01-02 15:04")
-		if t.Repeat == "daily" {
+		when := "下次 " + time.Unix(t.RunAt, 0).Format("2006-01-02 15:04")
+		switch t.Repeat {
+		case "daily":
 			when = "每天 " + time.Unix(t.RunAt, 0).Format("15:04")
+		case "hourly":
+			when = "每小时（下次 " + time.Unix(t.RunAt, 0).Format("15:04") + "）"
+		case "interval":
+			h := t.IntervalMinutes / 60
+			m := t.IntervalMinutes % 60
+			label := ""
+			if h > 0 && m > 0 {
+				label = fmt.Sprintf("每%d小时%d分钟", h, m)
+			} else if h > 0 {
+				label = fmt.Sprintf("每%d小时", h)
+			} else {
+				label = fmt.Sprintf("每%d分钟", t.IntervalMinutes)
+			}
+			when = label + "（下次 " + time.Unix(t.RunAt, 0).Format("15:04") + "）"
 		}
 		b.WriteString(fmt.Sprintf("[%d] %s — %s\n", t.ID, when, t.Instruction))
 	}
@@ -760,33 +844,67 @@ func formatScheduleList(list []store.UserScheduledTask) string {
 	return b.String()
 }
 
-// parseScheduleRunAt 解析执行时间：runAt 为 ISO 如 2006-01-02T15:04:05 或每日时间 09:00；repeat 为 "daily" 或空
-func parseScheduleRunAt(runAt, repeat string) (int64, error) {
+// parseDailyTime 解析 "09:00" "9:0" 等格式，返回当天（若已过则明天）的 Unix 时间戳
+func parseDailyTime(runAt string) (int64, error) {
 	now := time.Now()
-	if repeat == "daily" {
-		// 解析 09:00 或 9:00
-		for _, layout := range []string{"15:04", "15:4", "1:04", "1:4"} {
-			t, err := time.ParseInLocation(layout, runAt, now.Location())
-			if err != nil {
-				continue
-			}
-			next := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
-			if next.Before(now) || next.Equal(now) {
-				next = next.Add(24 * time.Hour)
-			}
-			return next.Unix(), nil
-		}
-		return 0, fmt.Errorf("每日时间格式应为 09:00 或 9:00")
-	}
-	// 单次：ISO
-	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04"} {
+	for _, layout := range []string{"15:04", "15:4", "1:04", "1:4"} {
 		t, err := time.ParseInLocation(layout, runAt, now.Location())
 		if err != nil {
 			continue
 		}
-		return t.Unix(), nil
+		next := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
+		if !next.After(now) {
+			next = next.Add(24 * time.Hour)
+		}
+		return next.Unix(), nil
 	}
-	return 0, fmt.Errorf("时间格式应为 2006-01-02T09:00:00 或 2006-01-02 09:00")
+	return 0, fmt.Errorf("每日时间格式应为 09:00 或 9:00")
+}
+
+// parseScheduleRunAt 解析执行时间；repeat 为 "daily"、"hourly"、"interval" 或空（单次）
+// intervalMins 仅 repeat="interval" 时有效
+func parseScheduleRunAt(runAt, repeat string, intervalMins ...int) (int64, error) {
+	now := time.Now()
+	switch repeat {
+	case "hourly":
+		if runAt == "" || strings.ToLower(runAt) == "now" || strings.ToLower(runAt) == "现在" {
+			return now.Add(time.Hour).Unix(), nil
+		}
+		for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04", "15:04"} {
+			t, err := time.ParseInLocation(layout, runAt, now.Location())
+			if err != nil {
+				continue
+			}
+			if layout == "15:04" {
+				t = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
+				if !t.After(now) {
+					t = t.Add(time.Hour)
+				}
+			}
+			return t.Unix(), nil
+		}
+		return now.Add(time.Hour).Unix(), nil
+	case "interval":
+		mins := 0
+		if len(intervalMins) > 0 {
+			mins = intervalMins[0]
+		}
+		if mins <= 0 {
+			mins = 60
+		}
+		return now.Add(time.Duration(mins) * time.Minute).Unix(), nil
+	case "daily":
+		return parseDailyTime(runAt)
+	default:
+		for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04"} {
+			t, err := time.ParseInLocation(layout, runAt, now.Location())
+			if err != nil {
+				continue
+			}
+			return t.Unix(), nil
+		}
+		return 0, fmt.Errorf("时间格式应为 2006-01-02T09:00:00 或 2006-01-02 09:00")
+	}
 }
 
 func runTask(cfg *config.Config, instruction string) string {

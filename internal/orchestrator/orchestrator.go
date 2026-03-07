@@ -67,9 +67,10 @@ func TopoSort(plan Plan) [][]Task {
 
 // Planner 用 LLM 将用户请求拆解为子任务；解析失败时降级为单任务计划
 func Planner(cfg *config.Config, userMessage string) (Plan, error) {
-	sys := `你是任务规划助手。根据用户的请求，拆解为多个可执行的子任务。必须输出纯 JSON，格式如下（不要其他文字）：
-{"tasks":[{"id":1,"step":"子任务一句话描述","after":[]},{"id":2,"step":"另一个子任务","after":[1]}]}
-规则：id 从 1 开始；step 是一句可单独执行的指令；after 填必须先完成的 id 列表，可并行则填 []；只有一个操作时只填一个 task。`
+	sys := `你是 WILL 机器人的任务规划助手。WILL 的能力仅限于：查看/添加/完成/删除待办、查看/添加/修改/删除定时任务、检查程序版本、普通对话和记忆、执行 shell 命令。
+根据用户请求，只生成 WILL 实际能执行的子任务，拆解为可执行步骤。必须输出纯 JSON（不要其他文字）：
+{"tasks":[{"id":1,"step":"子任务一句话，使用 WILL 支持的操作","after":[]},{"id":2,"step":"另一步","after":[1]}]}
+规则：id 从 1 开始；step 必须是 WILL 能完成的操作（如：查看待办、删除待办2、添加定时任务...）；after 填依赖的 id，可并行填 []；只有一个操作时只填一个 task。`
 	user := "用户说：" + userMessage
 
 	var plan Plan
