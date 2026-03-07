@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -9,6 +10,12 @@ import (
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
+
+// contentJSONString 飞书要求 content 为「JSON 字符串」而非对象，否则报 230001
+func contentJSONString(text string) string {
+	b, _ := json.Marshal(map[string]string{"text": text})
+	return string(b)
+}
 
 var (
 	globalClient *lark.Client
@@ -49,7 +56,7 @@ func ReplyMessage(messageID, text string) error {
 	if cli == nil {
 		return fmt.Errorf("feishu client not initialized")
 	}
-	content := larkim.NewTextMsgBuilder().Text(text).Build()
+	content := contentJSONString(text)
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(messageID).
 		Body(larkim.NewReplyMessageReqBodyBuilder().
@@ -73,7 +80,7 @@ func SendMessageToUser(openID, text string) error {
 	if cli == nil {
 		return fmt.Errorf("feishu client not initialized")
 	}
-	content := larkim.NewTextMsgBuilder().Text(text).Build()
+	content := contentJSONString(text)
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeOpenId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
