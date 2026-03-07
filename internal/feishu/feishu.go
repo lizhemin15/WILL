@@ -18,8 +18,10 @@ func contentJSONString(text string) string {
 }
 
 var (
-	globalClient *lark.Client
-	clientMu     sync.RWMutex
+	globalClient    *lark.Client
+	globalAppID     string
+	globalAppSecret string
+	clientMu        sync.RWMutex
 )
 
 // TestCredentials 校验飞书 App ID / Secret 是否可用（拉取 tenant token）
@@ -42,6 +44,15 @@ func InitClient(appID, appSecret string) {
 	clientMu.Lock()
 	defer clientMu.Unlock()
 	globalClient = lark.NewClient(appID, appSecret)
+	globalAppID = appID
+	globalAppSecret = appSecret
+}
+
+// GetCredentials 返回当前已初始化的 appID 和 appSecret
+func GetCredentials() (appID, appSecret string) {
+	clientMu.RLock()
+	defer clientMu.RUnlock()
+	return globalAppID, globalAppSecret
 }
 
 func getClient() *lark.Client {

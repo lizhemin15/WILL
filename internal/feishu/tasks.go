@@ -1,11 +1,19 @@
 package feishu
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"time"
 
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larktask "github.com/larksuite/oapi-sdk-go/v3/service/task/v1"
 )
+
+var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // TaskInfo 代表一条飞书任务的摘要信息
 type TaskInfo struct {
@@ -92,25 +100,48 @@ func CompleteTask(taskID string) error {
 	return nil
 }
 
-// UpdateTask 修改飞书任务的标题
+// UpdateTask 修改飞书任务的标题（通过原生 HTTP PATCH，SDK builder 不暴露 update_fields）
 func UpdateTask(taskID, newTitle string) error {
-	cli := getClient()
-	if cli == nil {
+	appID, appSecret := GetCredentials()
+	if appID == "" {
 		return fmt.Errorf("feishu client not initialized")
 	}
-	req := larktask.NewPatchTaskReqBuilder().
-		TaskId(taskID).
-		UpdateFields([]string{"summary"}).
-		Task(larktask.NewTaskBuilder().
-			Summary(newTitle).
-			Build()).
-		Build()
-	resp, err := cli.Task.V1.Task.Patch(context.Background(), req)
-	if err != nil {
-		return err
+
+	// 获取 tenant_access_token
+	cli := getClient()
+	tokenResp, err := cli.GetTenantAccessTokenBySelfBuiltApp(context.Background(), &larkcore.SelfBuiltTenantAccessTokenReq{
+		AppID:     appID,
+		AppSecret: appSecret,
+	})
+	if err != nil || tokenResp == nil {
+		return fmt.Errorf("获取 access token 失败: %w", err)
 	}
-	if !resp.Success() {
-		return fmt.Errorf("code=%d msg=%s", resp.Code, resp.Msg)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"task":          map[string]string{"summary": newTitle},
+		"update_fields": []string{"summary"},
+	})
+	req, _ := http.NewRequest(http.MethodPatch,
+		"https://open.feishu.cn/open-apis/task/v1/tasks/"+taskID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tokenResp.TenantAccessToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("响应解析失败: %w", err)
+	}
+	if result.Code != 0 {
+		return fmt.Errorf("code=%d msg=%s", result.Code, result.Msg)
 	}
 	return nil
 }
