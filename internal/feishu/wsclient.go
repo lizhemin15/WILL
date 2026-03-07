@@ -31,12 +31,19 @@ func StartWSClient(appID, appSecret string, onMessage ProcessMessageFunc) {
 				return nil
 			}
 			log.Printf("[feishu] 处理文本: %q", text)
-			reply, sendReply := onMessage(openID, messageID, text)
-			if sendReply && reply != "" {
-				if err := ReplyMessage(messageID, reply); err != nil {
-					log.Printf("feishu ws reply error: %v", err)
+			// 异步处理并回复，避免 LLM 调用超过飞书 3 秒限制导致超时
+			go func() {
+				reply, sendReply := onMessage(openID, messageID, text)
+				if sendReply && reply != "" {
+					if err := ReplyMessage(messageID, reply); err != nil {
+						log.Printf("[feishu] 回复失败: %v", err)
+					} else {
+						log.Printf("[feishu] 已回复 message_id=%q", messageID)
+					}
+				} else {
+					log.Printf("[feishu] 本条不回复 sendReply=%v reply_empty=%v", sendReply, reply == "")
 				}
-			}
+			}()
 			return nil
 		})
 	cli := ws.NewClient(appID, appSecret,
