@@ -92,6 +92,29 @@ func CompleteTask(taskID string) error {
 	return nil
 }
 
+// UpdateTask 修改飞书任务的标题
+func UpdateTask(taskID, newTitle string) error {
+	cli := getClient()
+	if cli == nil {
+		return fmt.Errorf("feishu client not initialized")
+	}
+	req := larktask.NewPatchTaskReqBuilder().
+		TaskId(taskID).
+		UpdateFields([]string{"summary"}).
+		Task(larktask.NewTaskBuilder().
+			Summary(newTitle).
+			Build()).
+		Build()
+	resp, err := cli.Task.V1.Task.Patch(context.Background(), req)
+	if err != nil {
+		return err
+	}
+	if !resp.Success() {
+		return fmt.Errorf("code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return nil
+}
+
 // DeleteTask 删除飞书任务
 func DeleteTask(taskID string) error {
 	cli := getClient()

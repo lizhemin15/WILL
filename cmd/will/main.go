@@ -216,6 +216,42 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		}
 		return fmt.Sprintf("已添加待办 [%d] %s %s", localID, title, syncNote)
 
+	case "todo_update":
+		var p struct {
+			Index    string `json:"index"`
+			NewTitle string `json:"new_title"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		newTitle := strings.TrimSpace(p.NewTitle)
+		if newTitle == "" {
+			return "新标题不能为空。"
+		}
+		idx, err := strconv.Atoi(strings.TrimSpace(p.Index))
+		if err != nil || idx < 1 {
+			return "序号无效，请传入 1 开始的数字。"
+		}
+		list, err := s.ListTodos(openID)
+		if err != nil {
+			return "读取待办失败: " + err.Error()
+		}
+		if idx > len(list) {
+			return fmt.Sprintf("序号 %d 超出范围，当前共 %d 条待办。", idx, len(list))
+		}
+		todo := list[idx-1]
+		if _, err := s.UpdateTodoTitle(todo.ID, openID, newTitle); err != nil {
+			return "修改失败: " + err.Error()
+		}
+		syncNote := ""
+		if todo.FeishuTaskID != "" {
+			if ferr := feishu.UpdateTask(todo.FeishuTaskID, newTitle); ferr != nil {
+				log.Printf("[todo] 更新飞书任务 %s 失败: %v", todo.FeishuTaskID, ferr)
+				syncNote = fmt.Sprintf("（飞书同步失败: %v）", ferr)
+			} else {
+				syncNote = "（已同步至飞书任务中心）"
+			}
+		}
+		return fmt.Sprintf("已将待办 [%d] 修改为：%s %s", idx, newTitle, syncNote)
+
 	case "todo_done", "todo_delete":
 		var p struct{ Indices string `json:"indices"` }
 		_ = json.Unmarshal(argsJSON, &p)

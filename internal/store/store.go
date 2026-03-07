@@ -256,6 +256,17 @@ func (s *Store) DeleteTodo(id int64, openID string) (bool, error) {
 	return n > 0, nil
 }
 
+func (s *Store) UpdateTodoTitle(id int64, openID, newTitle string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec("UPDATE todos SET title=? WHERE id=? AND open_id=?", newTitle, id, openID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // ── Scheduled Tasks ───────────────────────────────────────────────────────────
 
 type ScheduledTaskDue struct {

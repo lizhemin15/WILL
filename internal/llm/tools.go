@@ -33,6 +33,17 @@ var toolDefs = []map[string]interface{}{
 	{
 		"type": "function",
 		"function": map[string]interface{}{
+			"name":        "todo_update",
+			"description": "修改某条待办的标题内容，不会删除重建，直接在原条目上编辑。用户说「改」「修改」「更新」「把第X条改成」时使用此工具",
+			"parameters": objectParams(map[string]interface{}{
+				"index":     strParam("待办序号，1开始的数字"),
+				"new_title": strParam("修改后的待办标题"),
+			}, "index", "new_title"),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
 			"name":        "todo_delete",
 			"description": "删除一条或多条待办，indices 为1开始的序号，多个用逗号分隔",
 			"parameters": objectParams(map[string]interface{}{
