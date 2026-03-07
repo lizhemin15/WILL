@@ -15,45 +15,57 @@ import (
 	"github.com/yourusername/will/internal/store"
 )
 
-const maxHistoryRunes = 400 // 注入 LLM 的每条历史消息最大长度，防 token 爆炸
-const maxHistoryMessages = 10 // 最近对话轮数（约 5 轮）
+const (
+	maxHistoryMessages = 20
+	maxHistoryRunes    = 500
+	maxToolRounds      = 5
+)
 
-// llmClient 专用 HTTP 客户端，超时独立于全局 DefaultClient
+// llmClient 独立 HTTP 客户端，超时与全局 DefaultClient 隔离
 var llmClient = &http.Client{Timeout: 120 * time.Second}
 
-// AllowedConfigKeys 允许通过 LLM 写入的配置键（与 store 一致）
+// ToolExecutor 执行单个工具调用，返回结果字符串
+type ToolExecutor func(name string, argsJSON []byte) string
+
+// rawToolCall OpenAI tool_calls 结构
+type rawToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// message 用于构造和传递 LLM 消息历史
+type message struct {
+	Role       string        `json:"role"`
+	Content    string        `json:"content,omitempty"`
+	ToolCalls  []rawToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	Name       string        `json:"name,omitempty"`
+}
+
+// AllowedConfigKeys 允许通过 LLM/命令修改的配置键
 var AllowedConfigKeys = map[string]string{
-	"feishu_app_id":     store.ConfigKeyFeishuAppID,
-	"feishu_app_secret": store.ConfigKeyFeishuAppSecret,
-	"mode":              store.ConfigKeyMode,
-	"internal_token":    store.ConfigKeyInternalToken,
-	"worker_urls":       store.ConfigKeyWorkerURLs,
-	"port":              store.ConfigKeyPort,
-	"bind":              store.ConfigKeyBind,
-	"llm_api_key":       store.ConfigKeyLLMApiKey,
-	"llm_base_url":      store.ConfigKeyLLMBaseURL,
-	"llm_model":         store.ConfigKeyLLMModel,
+	"feishu_app_id":        store.ConfigKeyFeishuAppID,
+	"feishu_app_secret":    store.ConfigKeyFeishuAppSecret,
+	"llm_api_key":          store.ConfigKeyLLMApiKey,
+	"llm_base_url":         store.ConfigKeyLLMBaseURL,
+	"llm_model":            store.ConfigKeyLLMModel,
+	"mode":                 store.ConfigKeyMode,
+	"port":                 store.ConfigKeyPort,
+	"bind":                 store.ConfigKeyBind,
+	"internal_token":       store.ConfigKeyInternalToken,
+	"worker_urls":          store.ConfigKeyWorkerURLs,
+	"timezone":             store.ConfigKeyTimezone,
+	"feishu_subscribe_mode": store.ConfigKeyFeishuSubscribeMode,
 }
 
-// Response 期望 LLM 返回的 JSON 结构；先由 intent 判定意图再分发
-type Response struct {
-	Intent    string            `json:"intent"`
-	TodoTitle string            `json:"todo_title"`
-	TodoID    string            `json:"todo_id"`
-	// 定时任务：schedule_list / schedule_add / schedule_delete / schedule_update
-	ScheduleInstruction  string `json:"schedule_instruction"`   // 任务内容
-	ScheduleRunAt        string `json:"schedule_run_at"`         // 单个时间（daily/hourly/单次）
-	ScheduleRunAtList    string `json:"schedule_run_at_list"`    // 多个每日时间，逗号分隔如 "06:00,11:30,17:30"
-	ScheduleRepeat       string `json:"schedule_repeat"`          // "daily" | "hourly" | "interval" | ""
-	ScheduleIntervalMins string `json:"schedule_interval_mins"`  // repeat="interval" 时填间隔分钟数，如 "270"（4.5小时）
-	ScheduleID           string `json:"schedule_id"`              // schedule_delete/update 时填任务 id
-	Config    map[string]string `json:"config"`
-	Memory    map[string]string `json:"memory"`
-	Command   string            `json:"command"`
-	Reply     string            `json:"reply"`
-}
+// PendingConfigKey 存在 memory 中的待确认配置变更键
+const PendingConfigKey = "_pending_config"
 
-// TestConfig 校验 LLM 配置是否可用（发一次最小 completion 请求）
+// TestConfig 校验 LLM 配置是否可用
 func TestConfig(cfg *config.Config) error {
 	if cfg == nil || cfg.LLMApiKey == "" {
 		return fmt.Errorf("未配置 LLM API Key")
@@ -73,11 +85,8 @@ func TestConfig(cfg *config.Config) error {
 		},
 		"max_tokens": 1,
 	}
-	bodyBytes, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return err
-	}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
 	resp, err := llmClient.Do(req)
@@ -91,7 +100,7 @@ func TestConfig(cfg *config.Config) error {
 	return nil
 }
 
-// CallChat 发一次对话补全，返回首条回复内容（供规划/审查等用）
+// CallChat 发一次简单对话补全，返回文本（供 orchestrator 使用）
 func CallChat(cfg *config.Config, systemPrompt, userContent string) (string, error) {
 	if cfg == nil || cfg.LLMApiKey == "" {
 		return "", fmt.Errorf("未配置 LLM")
@@ -101,16 +110,13 @@ func CallChat(cfg *config.Config, systemPrompt, userContent string) (string, err
 	if model == "" {
 		model = "gpt-4o-mini"
 	}
-	messages := []map[string]string{
+	msgs := []map[string]string{
 		{"role": "system", "content": systemPrompt},
 		{"role": "user", "content": userContent},
 	}
-	body := map[string]interface{}{"model": model, "messages": messages, "max_tokens": 2048}
-	bodyBytes, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", err
-	}
+	body := map[string]interface{}{"model": model, "messages": msgs}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
 	resp, err := llmClient.Do(req)
@@ -124,9 +130,7 @@ func CallChat(cfg *config.Config, systemPrompt, userContent string) (string, err
 	}
 	var apiResp struct {
 		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
+			Message struct{ Content string `json:"content"` } `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(raw, &apiResp); err != nil || len(apiResp.Choices) == 0 {
@@ -135,149 +139,138 @@ func CallChat(cfg *config.Config, systemPrompt, userContent string) (string, err
 	return strings.TrimSpace(apiResp.Choices[0].Message.Content), nil
 }
 
-// Call 调用 LLM，解析出 config/memory/command/reply；若 s 非空则从 SQLite 拉取该用户记忆作为上下文
-func Call(cfg *config.Config, userScope string, userMessage string, s *store.Store) (Response, error) {
-	var out Response
-	if cfg.LLMApiKey == "" {
-		return out, fmt.Errorf("未配置 LLM（OPENAI_API_KEY 或 llm_api_key）")
+// Call 主要 LLM 调用入口：使用 Function Calling，内部处理工具调用循环
+// executor 负责执行工具并返回结果字符串
+func Call(cfg *config.Config, scope, userMessage string, s *store.Store, executor ToolExecutor) (string, error) {
+	if cfg == nil || cfg.LLMApiKey == "" {
+		return "", fmt.Errorf("未配置 LLM（OPENAI_API_KEY 或 llm_api_key）")
 	}
-
 	baseURL := strings.TrimRight(cfg.LLMBaseURL, "/")
 	model := cfg.LLMModel
 	if model == "" {
 		model = "gpt-4o-mini"
 	}
 
-	sys := `你是 WILL，运行在飞书上的个人助手。能力仅限：待办管理、定时任务、版本检查、普通对话/记忆、执行 shell 命令。不能访问外部网站、发邮件、接入第三方平台。
+	// 构建 system prompt
+	sys := buildSystemPrompt(cfg, scope, s)
 
-定时任务（schedule_add）字段说明：
-- schedule_instruction：执行时系统会注入最新待办和对话，只需描述角色和任务，如「作为严厉导师，基于当前待办和对话，给出下一步建议」
-- schedule_repeat："daily"（每天固定时间）| "hourly"（每小时）| "interval"（按间隔分钟数）| ""（单次）
-- schedule_run_at：单个时间，daily 填 "09:00"，hourly/interval 可留空，单次填 ISO 如 "2025-03-07T09:00"
-- schedule_run_at_list：多个每日时间，逗号分隔如 "06:00,11:30,17:30,21:00"（用户指定多个时间点时填此字段，同时 schedule_repeat="daily"）
-- schedule_interval_mins：repeat="interval" 时填间隔分钟数，如 "270"（4.5小时）、"240"（4小时）
+	// 初始消息列表
+	msgs := []message{{Role: "system", Content: sys}}
 
-示例：用户说「每天6点和21点提醒」→ schedule_repeat="daily", schedule_run_at_list="06:00,21:00"
-示例：用户说「每隔4-5小时」→ schedule_repeat="interval", schedule_interval_mins="270"
-
-必须用纯 JSON 回复（不要其他文字）：
-{"intent":"", "todo_title":"", "todo_id":"", "schedule_instruction":"", "schedule_run_at":"", "schedule_run_at_list":"", "schedule_repeat":"", "schedule_interval_mins":"", "schedule_id":"", "config":{}, "memory":{}, "command":"", "reply":""}
-
-意图：todo_list/todo_add/todo_done/todo_delete/version_check/schedule_list/schedule_add/schedule_update/schedule_delete/空
-config key 仅限：feishu_app_id, feishu_app_secret, llm_api_key, llm_base_url, llm_model, mode, port, bind, internal_token, worker_urls`
-
+	// 注入对话历史
 	if s != nil {
-		mem, err := s.ListMemory(userScope)
-		if err == nil && len(mem) > 0 {
-			keys := make([]string, 0, len(mem))
-			for k := range mem {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			var lines []string
-			for _, k := range keys {
-				lines = append(lines, k+": "+mem[k])
-			}
-			sys += "\n\n当前用户记忆（可引用、需更新时在 memory 里返回）：\n" + strings.Join(lines, "\n")
+		openID := strings.TrimPrefix(scope, "user:")
+		history, _ := s.GetRecentConversation(openID, maxHistoryMessages)
+		for _, m := range history {
+			msgs = append(msgs, message{
+				Role:    m.Role,
+				Content: truncateRunes(m.Content, maxHistoryRunes),
+			})
 		}
 	}
+	msgs = append(msgs, message{Role: "user", Content: userMessage})
 
-	messages := []map[string]string{{"role": "system", "content": sys}}
-	if s != nil {
-		openID := strings.TrimPrefix(userScope, "user:")
-		history, err := s.GetRecentConversation(openID, maxHistoryMessages)
-		if err == nil && len(history) > 0 {
-			for _, m := range history {
-				content := truncateRunes(m.Content, maxHistoryRunes)
-				messages = append(messages, map[string]string{"role": m.Role, "content": content})
-			}
+	// 工具调用循环
+	for round := 0; round < maxToolRounds; round++ {
+		bodyMap := map[string]interface{}{
+			"model":       model,
+			"messages":    msgs,
+			"tools":       toolDefs,
+			"tool_choice": "auto",
 		}
-	}
-	messages = append(messages, map[string]string{"role": "user", "content": userMessage})
+		bodyBytes, _ := json.Marshal(bodyMap)
 
-	body := map[string]interface{}{
-		"model":           model,
-		"messages":        messages,
-		"response_format": map[string]string{"type": "json_object"},
-	}
-	bodyBytes, _ := json.Marshal(body)
-
-	const maxParseRetries = 3
-	var lastRaw string
-	for attempt := 0; attempt < maxParseRetries; attempt++ {
 		req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
 		if err != nil {
-			return out, err
+			return "", err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
 
 		resp, err := llmClient.Do(req)
 		if err != nil {
-			return out, err
+			return "", fmt.Errorf("LLM 连接失败: %w", err)
 		}
-		raw, readErr := io.ReadAll(resp.Body)
+		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if readErr != nil {
-			return out, readErr
-		}
+
 		if resp.StatusCode != http.StatusOK {
-			// 部分提供商不支持 response_format，降级重试（去掉 response_format）
-			if resp.StatusCode == 400 || resp.StatusCode == 422 {
-				bodyFallback := map[string]interface{}{
-					"model":    model,
-					"messages": messages,
-				}
-				bodyBytes, _ = json.Marshal(bodyFallback)
-				continue
-			}
 			msg := string(raw)
 			if len(msg) > 300 {
 				msg = msg[:300] + "..."
 			}
-			if msg != "" {
-				return out, fmt.Errorf("LLM 请求失败: %d — %s", resp.StatusCode, strings.TrimSpace(msg))
-			}
-			return out, fmt.Errorf("LLM 请求失败: %d", resp.StatusCode)
+			return "", fmt.Errorf("LLM 请求失败: %d — %s", resp.StatusCode, strings.TrimSpace(msg))
 		}
 
 		var apiResp struct {
 			Choices []struct {
 				Message struct {
-					Content string `json:"content"`
+					Content   string        `json:"content"`
+					ToolCalls []rawToolCall `json:"tool_calls"`
 				} `json:"message"`
+				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
 		}
-		if err := json.Unmarshal(raw, &apiResp); err != nil {
-			return out, err
+		if err := json.Unmarshal(raw, &apiResp); err != nil || len(apiResp.Choices) == 0 {
+			return "", fmt.Errorf("LLM 未返回有效内容")
 		}
-		if len(apiResp.Choices) == 0 {
-			return out, fmt.Errorf("LLM 未返回内容")
+
+		choice := apiResp.Choices[0]
+
+		// 没有工具调用 → 返回文本
+		if len(choice.Message.ToolCalls) == 0 {
+			return strings.TrimSpace(choice.Message.Content), nil
 		}
-		content := strings.TrimSpace(apiResp.Choices[0].Message.Content)
-		lastRaw = content
-		jsonStr := extractJSON(content)
-		if err := json.Unmarshal([]byte(jsonStr), &out); err == nil {
-			return out, nil
+
+		// 有工具调用 → 执行并追加结果
+		assistantMsg := message{
+			Role:      "assistant",
+			ToolCalls: choice.Message.ToolCalls,
 		}
-		// 解析失败：短暂等待后重试
-		if attempt < maxParseRetries-1 {
-			time.Sleep(400 * time.Millisecond)
+		if choice.Message.Content != "" {
+			assistantMsg.Content = choice.Message.Content
+		}
+		msgs = append(msgs, assistantMsg)
+
+		for _, tc := range choice.Message.ToolCalls {
+			result := ""
+			if executor != nil {
+				result = executor(tc.Function.Name, []byte(tc.Function.Arguments))
+			}
+			msgs = append(msgs, message{
+				Role:       "tool",
+				Content:    result,
+				ToolCallID: tc.ID,
+				Name:       tc.Function.Name,
+			})
 		}
 	}
-	// 全部重试失败：尝试从不完整 JSON 中提取 reply 字段，否则返回原始内容
-	out.Reply = extractReplyField(lastRaw)
-	if out.Reply == "" {
-		out.Reply = lastRaw
+
+	// 超过最大轮数，做最后一次不带工具的调用
+	bodyMap := map[string]interface{}{"model": model, "messages": msgs}
+	bodyBytes, _ := json.Marshal(bodyMap)
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
+	resp, err := llmClient.Do(req)
+	if err != nil {
+		return "", err
 	}
-	if out.Reply == "" {
-		out.Reply = "抱歉，我没能理解你的意思，请换一种方式表达。"
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var final struct {
+		Choices []struct {
+			Message struct{ Content string `json:"content"` } `json:"message"`
+		} `json:"choices"`
 	}
-	return out, nil
+	if err := json.Unmarshal(raw, &final); err != nil || len(final.Choices) == 0 {
+		return "已处理完成。", nil
+	}
+	return strings.TrimSpace(final.Choices[0].Message.Content), nil
 }
 
-// CallForInstruction 执行定时任务指令：把实际待办列表和近期对话注入上下文，再由 LLM 分析并输出结论
-func CallForInstruction(cfg *config.Config, userScope string, instruction string, s *store.Store) (string, error) {
+// CallForInstruction 定时任务执行：注入用户实际数据（待办/对话/记忆），直接输出文字结果
+func CallForInstruction(cfg *config.Config, scope, instruction string, s *store.Store) (string, error) {
 	if cfg == nil || cfg.LLMApiKey == "" {
 		return "", fmt.Errorf("未配置 LLM")
 	}
@@ -287,16 +280,16 @@ func CallForInstruction(cfg *config.Config, userScope string, instruction string
 		model = "gpt-4o-mini"
 	}
 
-	// 构建上下文：从数据库拉取实际数据注入 system prompt，LLM 直接分析而非去"获取"
 	var ctxBuf strings.Builder
-	ctxBuf.WriteString("你是一个助手，正在自动执行定时任务。下方已提供所有相关数据，直接基于这些数据执行指令并输出简洁结论。不要 JSON，只输出给用户看的文字。\n")
+	ctxBuf.WriteString("你正在执行一个定时任务。以下是用户的最新数据，直接基于这些数据执行指令，输出给用户看的文字（不要 JSON，不要菜单选项）。\n")
 
 	if s != nil {
-		openID := strings.TrimPrefix(userScope, "user:")
-		// 注入待办列表
-		todos, err := s.ListTodos(openID)
-		if err == nil && len(todos) > 0 {
-			ctxBuf.WriteString("\n【当前待办列表】\n")
+		openID := strings.TrimPrefix(scope, "user:")
+		todos, _ := s.ListTodos(openID)
+		ctxBuf.WriteString("\n【当前待办列表】\n")
+		if len(todos) == 0 {
+			ctxBuf.WriteString("（无待办）\n")
+		} else {
 			for i, t := range todos {
 				status := "未完成"
 				if t.Status == "done" {
@@ -304,47 +297,44 @@ func CallForInstruction(cfg *config.Config, userScope string, instruction string
 				}
 				ctxBuf.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, t.Title, status))
 			}
-		} else {
-			ctxBuf.WriteString("\n【当前待办列表】暂无待办。\n")
 		}
-		// 注入近期对话
-		history, err := s.GetRecentConversation(openID, maxHistoryMessages)
-		if err == nil && len(history) > 0 {
-			ctxBuf.WriteString("\n【近期对话记录】\n")
+
+		history, _ := s.GetRecentConversation(openID, 10)
+		ctxBuf.WriteString("\n【近期对话记录】\n")
+		if len(history) == 0 {
+			ctxBuf.WriteString("（无记录）\n")
+		} else {
 			for _, m := range history {
 				role := "用户"
 				if m.Role == "assistant" {
 					role = "助手"
 				}
-				ctxBuf.WriteString(role + ": " + truncateRunes(m.Content, maxHistoryRunes) + "\n")
+				ctxBuf.WriteString(role + ": " + truncateRunes(m.Content, 200) + "\n")
 			}
 		}
-		// 注入用户记忆
-		mem, err := s.ListMemory(userScope)
-		if err == nil && len(mem) > 0 {
+
+		mem, _ := s.ListMemory(scope)
+		if len(mem) > 0 {
+			ctxBuf.WriteString("\n【用户记忆】\n")
 			keys := make([]string, 0, len(mem))
 			for k := range mem {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
-			ctxBuf.WriteString("\n【用户记忆】\n")
 			for _, k := range keys {
 				ctxBuf.WriteString(k + ": " + mem[k] + "\n")
 			}
 		}
 	}
 
-	sys := ctxBuf.String()
-	messages := []map[string]string{
-		{"role": "system", "content": sys},
+	sysPart := ctxBuf.String()
+	msgs := []map[string]string{
+		{"role": "system", "content": sysPart},
 		{"role": "user", "content": instruction},
 	}
-	body := map[string]interface{}{"model": model, "messages": messages, "max_tokens": 1024}
-	bodyBytes, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", err
-	}
+	body := map[string]interface{}{"model": model, "messages": msgs}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
 	resp, err := llmClient.Do(req)
@@ -358,9 +348,7 @@ func CallForInstruction(cfg *config.Config, userScope string, instruction string
 	}
 	var apiResp struct {
 		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
+			Message struct{ Content string `json:"content"` } `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(raw, &apiResp); err != nil || len(apiResp.Choices) == 0 {
@@ -369,44 +357,44 @@ func CallForInstruction(cfg *config.Config, userScope string, instruction string
 	return strings.TrimSpace(apiResp.Choices[0].Message.Content), nil
 }
 
-// PendingConfigKey 存在此 key 时表示有待用户确认的配置变更（值为 JSON map[storeKey]value）
-const PendingConfigKey = "pending_config"
+// buildSystemPrompt 构建主系统提示词，注入记忆上下文
+func buildSystemPrompt(cfg *config.Config, scope string, s *store.Store) string {
+	tz := "Asia/Shanghai"
+	if cfg != nil && cfg.Timezone != "" {
+		tz = cfg.Timezone
+	}
+	loc, _ := time.LoadLocation(tz)
+	if loc == nil {
+		loc = time.UTC
+	}
+	now := time.Now().In(loc).Format("2006-01-02 15:04 (Mon) MST")
 
-// Apply 将 LLM 返回的 config/memory 写入 store；配置类修改不直接生效，写入待确认，需用户回复「确认」后才生效
-func Apply(s *store.Store, openID string, r Response) (command string, reply string) {
-	if s == nil {
-		return r.Command, r.Reply
-	}
-	scope := "user:" + openID
-	// 配置变更：一律进入待确认，不直接写 SetConfig
-	if len(r.Config) > 0 {
-		pending := make(map[string]string)
-		var keys []string
-		for k, v := range r.Config {
-			k = strings.ToLower(strings.TrimSpace(k))
-			v = strings.TrimSpace(v)
-			if v == "" {
-				continue
+	sys := `你是 WILL，运行在飞书上的个人助手。
+- 使用工具完成待办、定时任务、版本检查、记忆等操作；普通对话直接文字回复
+- 直接执行用户意图，不要输出选项菜单或让用户"回复某某"
+- 用户指定多个定时时间点时，多次调用 schedule_add 工具（每个时间点一次）
+- 当前时间：` + now
+
+	if s != nil {
+		mem, err := s.ListMemory(scope)
+		if err == nil && len(mem) > 0 {
+			keys := make([]string, 0, len(mem))
+			for k := range mem {
+				if k == PendingConfigKey {
+					continue
+				}
+				keys = append(keys, k)
 			}
-			storeKey, ok := AllowedConfigKeys[k]
-			if !ok {
-				continue
-			}
-			pending[storeKey] = v
-			keys = append(keys, k)
-		}
-		if len(pending) > 0 {
 			sort.Strings(keys)
-			jsonBytes, _ := json.Marshal(pending)
-			_ = s.SetMemory(scope, PendingConfigKey, string(jsonBytes))
-			return "", "将修改以下配置，请回复「确认」生效或「取消」忽略：" + strings.Join(keys, "、")
+			if len(keys) > 0 {
+				sys += "\n\n【用户记忆】"
+				for _, k := range keys {
+					sys += "\n" + k + ": " + mem[k]
+				}
+			}
 		}
 	}
-	// 无配置变更时，照常写 memory
-	for k, v := range r.Memory {
-		_ = s.SetMemory(scope, strings.TrimSpace(k), strings.TrimSpace(v))
-	}
-	return strings.TrimSpace(r.Command), r.Reply
+	return sys
 }
 
 func truncateRunes(s string, max int) string {
@@ -414,98 +402,4 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string([]rune(s)[:max]) + "…"
-}
-
-// extractReplyField 从可能不完整的 JSON 文本中提取 "reply" 字段值（容错）
-func extractReplyField(s string) string {
-	// 尝试找 "reply":"..." 模式，支持转义字符和截断
-	key := `"reply":"`
-	idx := strings.Index(s, key)
-	if idx < 0 {
-		return ""
-	}
-	start := idx + len(key)
-	var buf []rune
-	runes := []rune(s)
-	escape := false
-	for i := start; i < len(runes); i++ {
-		ch := runes[i]
-		if escape {
-			switch ch {
-			case 'n':
-				buf = append(buf, '\n')
-			case 't':
-				buf = append(buf, '\t')
-			case '"', '\\', '/':
-				buf = append(buf, ch)
-			default:
-				buf = append(buf, '\\', ch)
-			}
-			escape = false
-			continue
-		}
-		if ch == '\\' {
-			escape = true
-			continue
-		}
-		if ch == '"' {
-			break
-		}
-		buf = append(buf, ch)
-	}
-	return strings.TrimSpace(string(buf))
-}
-
-// extractJSON 从字符串中提取第一个完整的 JSON 对象（用括号计数，避免截断/截错）
-func extractJSON(s string) string {
-	s = strings.TrimSpace(s)
-	// 去掉 markdown 代码块包裹
-	for _, fence := range []string{"```json", "```"} {
-		if strings.HasPrefix(s, fence) {
-			s = strings.TrimPrefix(s, fence)
-			if idx := strings.LastIndex(s, "```"); idx > 0 {
-				s = s[:idx]
-			}
-			s = strings.TrimSpace(s)
-			break
-		}
-	}
-	start := strings.Index(s, "{")
-	if start < 0 {
-		return s
-	}
-	depth, i := 0, start
-	runes := []rune(s)
-	inStr, escape := false, false
-	for i < len(runes) {
-		ch := runes[i]
-		if escape {
-			escape = false
-			i++
-			continue
-		}
-		if ch == '\\' && inStr {
-			escape = true
-			i++
-			continue
-		}
-		if ch == '"' {
-			inStr = !inStr
-			i++
-			continue
-		}
-		if !inStr {
-			if ch == '{' {
-				depth++
-			} else if ch == '}' {
-				depth--
-				if depth == 0 {
-					return string(runes[start : i+1])
-				}
-			}
-		}
-		i++
-	}
-	// 未找到完整对象，返回从 start 到末尾（可能是截断的，调用方会重试）
-	return string(runes[start:])
 }

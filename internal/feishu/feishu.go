@@ -74,6 +74,34 @@ func ReplyMessage(messageID, text string) error {
 	return nil
 }
 
+// IsAllowed 检查 openID 是否在允许列表；列表为空时允许所有人
+func IsAllowed(openID string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, id := range allowed {
+		if id == openID {
+			return true
+		}
+	}
+	return false
+}
+
+// InitAndListen 初始化飞书客户端并阻塞监听消息。
+// mode: "ws"（长连接，默认）或 "webhook"（暂未实现）。
+// onMessage(openID, text, messageID) 负责处理消息并自行发送回复。
+func InitAndListen(appID, appSecret, mode string, onMessage func(openID, text, messageID string)) error {
+	InitClient(appID, appSecret)
+	if mode == "webhook" {
+		return fmt.Errorf("webhook 模式尚未实现，请将 FEISHU_SUBSCRIBE_MODE 设为 ws")
+	}
+	StartWSClient(appID, appSecret, func(openID, messageID, content string) (string, bool) {
+		onMessage(openID, content, messageID)
+		return "", false
+	})
+	return nil
+}
+
 // SendMessageToUser 主动给用户发消息（通过 SDK Im.Message.Create，receive_id_type=open_id）
 func SendMessageToUser(openID, text string) error {
 	cli := getClient()

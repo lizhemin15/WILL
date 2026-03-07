@@ -42,14 +42,17 @@ func HandleCommand(text string, openID string, s *store.Store, cfg *config.Confi
 	parts := strings.SplitN(text, " ", 4)
 	cmd := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
 	if len(parts) < 2 {
-		if cmd == "help" || cmd == "" {
+		switch cmd {
+		case "help", "":
 			return cmdHelp(), true
-		}
-		if cmd == "config" {
+		case "config":
 			return cmdConfigGet(s, cfg), true
-		}
-		if cmd == "todo" {
+		case "todo":
 			return cmdTodo(nil, openID, s), true
+		case "status":
+			return cmdStatus(openID, s, cfg), true
+		case "reset", "new":
+			return cmdReset(openID, s), true
 		}
 		return "用法: /help", true
 	}
@@ -63,24 +66,31 @@ func HandleCommand(text string, openID string, s *store.Store, cfg *config.Confi
 		return cmdMemory(args, openID, s), true
 	case "todo":
 		return cmdTodo(args, openID, s), true
+	case "status":
+		return cmdStatus(openID, s, cfg), true
+	case "reset", "new":
+		return cmdReset(openID, s), true
 	default:
 		return "", false
 	}
 }
 
 func cmdHelp() string {
-	return `WILL 命令:
-/allow me          — 将当前用户加入授权列表
-/config get        — 查看当前配置（密钥脱敏）
-/config <key> <v>  — 设置 key（含 feishu_app_id、feishu_app_secret、llm_*、mode、worker_urls 等）
-/memory set <k> <v> — 记录记忆
-/memory get <k>     — 读取记忆
-/memory list       — 列出当前 scope 的记忆
+	return `WILL 命令：
+/status            — 会话状态（模型、对话轮数、记忆、定时任务）
+/reset  /new       — 清空对话历史，开始新会话
+/compact           — 压缩对话历史（由 AI 摘要，节省上下文）
 /todo              — 待办列表
 /todo add <内容>   — 添加待办
 /todo done <id>    — 标为已完成
 /todo delete <id>  — 删除待办
-自然语言也可：直接说「把飞书 app id 设为 xxx」或「执行 ls」，由 LLM 解析后写入配置或执行命令。`
+/memory list       — 列出记忆
+/memory set <k> <v> — 记录记忆
+/config get        — 查看当前配置（密钥脱敏）
+/config <key> <v>  — 修改配置（llm_api_key、llm_base_url、llm_model 等）
+/allow me          — 将当前用户加入授权列表
+
+自然语言也可：直接说「添加待办 xxx」「每天9点提醒我」「现在几点」等，AI 会直接处理。`
 }
 
 func cmdAllow(arg string, openID string, s *store.Store) string {
@@ -308,6 +318,56 @@ func resolveTodoIndices(list []store.Todo, args []string) (ids []int64, indices 
 		}
 	}
 	return ids, indices
+}
+
+// cmdStatus 展示当前会话状态（参考 OpenClaw /status）
+func cmdStatus(openID string, s *store.Store, cfg *config.Config) string {
+	model := "gpt-4o-mini"
+	if cfg != nil && cfg.LLMModel != "" {
+		model = cfg.LLMModel
+	}
+	baseURL := "https://api.openai.com/v1"
+	if cfg != nil && cfg.LLMBaseURL != "" {
+		baseURL = cfg.LLMBaseURL
+	}
+
+	var convCount, todoTotal, todoPending, schedCount, memCount int
+	if s != nil {
+		convCount = s.ConversationCount(openID)
+		if todos, err := s.ListTodos(openID); err == nil {
+			todoTotal = len(todos)
+			for _, t := range todos {
+				if t.Status != "done" {
+					todoPending++
+				}
+			}
+		}
+		if tasks, err := s.ListUserScheduledTasks(openID); err == nil {
+			schedCount = len(tasks)
+		}
+		if mem, err := s.ListMemory("user:" + openID); err == nil {
+			for k := range mem {
+				if k != "_pending_config" {
+					memCount++
+				}
+			}
+		}
+	}
+	return fmt.Sprintf(
+		"WILL 状态\n模型: %s\n接入点: %s\n对话记录: %d 条\n待办: %d（%d 未完成）\n定时任务: %d 个\n记忆条目: %d 条",
+		model, baseURL, convCount, todoTotal, todoPending, schedCount, memCount,
+	)
+}
+
+// cmdReset 清空当前用户的对话历史（参考 OpenClaw /reset /new）
+func cmdReset(openID string, s *store.Store) string {
+	if s == nil {
+		return "未启用本地存储。"
+	}
+	if err := s.ClearConversation(openID); err != nil {
+		return "清空失败: " + err.Error()
+	}
+	return "对话历史已清空，开始新对话。"
 }
 
 func formatTodoIndices(indices []int) string {

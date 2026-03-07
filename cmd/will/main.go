@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yourusername/will/internal/bot"
@@ -23,267 +24,134 @@ import (
 	"github.com/yourusername/will/internal/updater"
 )
 
-// Version 由构建时注入：-ldflags "-X main.Version=v0.0.3"
-var Version = "dev"
+// ── 消息去重（OpenClaw 风格：防止飞书重推导致重复处理）────────────────────────
+var (
+	seenMsgIDs   = make(map[string]struct{})
+	seenMsgQueue []string
+	seenMsgMu    sync.Mutex
+)
+
+const maxSeenMsgs = 200
+
+// markSeen 首次见到返回 true；已处理过返回 false
+func markSeen(id string) bool {
+	if id == "" {
+		return true
+	}
+	seenMsgMu.Lock()
+	defer seenMsgMu.Unlock()
+	if _, exists := seenMsgIDs[id]; exists {
+		return false
+	}
+	seenMsgIDs[id] = struct{}{}
+	seenMsgQueue = append(seenMsgQueue, id)
+	if len(seenMsgQueue) > maxSeenMsgs {
+		delete(seenMsgIDs, seenMsgQueue[0])
+		seenMsgQueue = seenMsgQueue[1:]
+	}
+	return true
+}
+
+const Version = "0.1.0"
 
 func main() {
-	var s *store.Store
-	cfg := config.Load()
+	s, err := store.Open("")
+	if err != nil {
+		log.Fatalf("打开数据库失败: %v", err)
+	}
+	defer s.Close()
 
-	if cfg.Mode != config.ModeWorker {
-		if st, err := store.Open(""); err != nil {
-			log.Printf("WILL: 未使用本地数据库 (%v)，仅从环境变量加载配置。", err)
-		} else {
-			s = st
-			defer s.Close()
-			cfg = config.LoadFromStore(s)
-			// 启动时检测 LLM、飞书：缺失或校验失败则交互填写，直到通过（飞书可回车跳过）
-			if next := setup.RunStartup(s); next != nil {
-				cfg = next
-			}
-		}
-		if cfg.LLMApiKey == "" {
-			log.Fatal("请先配置 LLM：运行程序时按命令行提示输入，或设置环境变量 OPENAI_*，或访问 http://本机:PORT/setup 后重启。")
-		}
+	cfg := setup.RunStartup(s)
+	if cfg == nil {
+		cfg = config.LoadFromStore(s)
 	}
 
-	mux := http.NewServeMux()
-
-	if cfg.Mode == config.ModeWorker {
-		if cfg.InternalToken == "" {
-			log.Fatal("WILL_MODE=worker 时必须设置 WILL_INTERNAL_TOKEN")
+	// 检查更新后通知
+	if notifyID, ok := s.GetConfig(store.ConfigKeyPostUpdateNotifyOpenID); ok && notifyID != "" {
+		_ = s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, "")
+		notes := updater.ReleaseNotes(Version)
+		msg := "WILL 已更新到 v" + Version + "。"
+		if notes != "" {
+			msg += "\n\n更新内容：\n" + notes
 		}
-		mux.HandleFunc("/internal/exec", internalapi.AuthMiddleware(cfg.InternalToken, internalapi.HandleExec))
-		mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"ok":true,"mode":"worker"}`))
-		})
-		log.Printf("WILL worker listening on %s:%s", cfg.Bind, cfg.Port)
-	} else {
-		mux.HandleFunc("/feishu", handleFeishu(s))
-		mux.HandleFunc("/setup", handleSetup(s))
-		if cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
-			feishu.InitClient(cfg.FeishuAppID, cfg.FeishuAppSecret)
-			if s != nil {
-				openID, _ := s.GetConfig(store.ConfigKeyPostUpdateNotifyOpenID)
-				if openID != "" {
-					s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, "")
-					notes := updater.ReleaseNotes(Version)
-					msg := "WILL 已更新到 v" + Version + "。"
-					if notes != "" {
-						msg += "\n\n本版更新说明：\n" + notes
-					}
-					_ = feishu.SendMessageToUser(openID, msg)
-				}
-			}
-			if cfg.FeishuSubscribeMode == "ws" {
-				go feishu.StartWSClient(cfg.FeishuAppID, cfg.FeishuAppSecret, func(openID, messageID, text string) (string, bool) {
-					return processFeishuMessage(s, openID, messageID, text)
-				})
-			}
-		}
-		mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"ok":true,"mode":"` + string(cfg.Mode) + `"}`))
-		})
-		if cfg.InternalToken != "" {
-			mux.HandleFunc("/internal/exec", internalapi.AuthMiddleware(cfg.InternalToken, internalapi.HandleExec))
-		}
-		log.Printf("WILL %s listening on %s:%s (db=%v)", cfg.Mode, cfg.Bind, cfg.Port, s != nil)
-		if s != nil {
-			go runVersionCheck(s)
-			go runScheduledTasks(s)
-		}
+		_ = feishu.SendMessageToUser(notifyID, msg)
 	}
 
-	addr := cfg.Bind + ":" + cfg.Port
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatal(err)
-	}
-}
+	// 启动定时任务 goroutine
+	go runScheduledTasks(s)
 
-func handleSetup(s *store.Store) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s == nil {
-			http.Error(w, "未启用本地数据库", http.StatusServiceUnavailable)
-			return
-		}
-		// 仅允许本机或带 token 的请求
-		if tok := os.Getenv("WILL_SETUP_TOKEN"); tok != "" {
-			if r.Header.Get("Authorization") != "Bearer "+tok && r.URL.Query().Get("token") != tok {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
+		if err := feishu.InitAndListen(cfg.FeishuAppID, cfg.FeishuAppSecret, cfg.FeishuSubscribeMode, func(openID, text, messageID string) {
+			if !markSeen(messageID) {
+				log.Printf("[feishu] 跳过重复消息 %s", messageID)
 				return
 			}
-		} else if !isLocal(r) {
-			http.Error(w, "仅允许本机访问", http.StatusForbidden)
-			return
-		}
-
-		if r.Method == http.MethodGet {
-			cfg := config.LoadFromStore(s)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(buildSetupHTML(cfg)))
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "invalid form", http.StatusBadRequest)
-			return
-		}
-
-		set := func(key, v string) {
-			v = strings.TrimSpace(v)
-			if v != "" {
-				_ = s.SetConfig(key, v)
-			}
-		}
-		set(store.ConfigKeyLLMApiKey, r.Form.Get("llm_api_key"))
-		set(store.ConfigKeyLLMBaseURL, r.Form.Get("llm_base_url"))
-		set(store.ConfigKeyLLMModel, r.Form.Get("llm_model"))
-		set(store.ConfigKeyFeishuAppID, r.Form.Get("feishu_app_id"))
-		set(store.ConfigKeyFeishuAppSecret, r.Form.Get("feishu_app_secret"))
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte("已保存。若刚配置飞书，请重启 WILL 使长连接生效；默认使用长连接，无需公网 URL。"))
-	}
-}
-
-func isLocal(r *http.Request) bool {
-	host := r.RemoteAddr
-	if i := strings.LastIndex(host, ":"); i >= 0 {
-		host = host[:i]
-	}
-	return host == "127.0.0.1" || host == "::1" || host == "localhost"
-}
-
-func buildSetupHTML(cfg *config.Config) string {
-	esc := func(s string) string {
-		return strings.NewReplacer("&", "&amp;", "\"", "&quot;", "<", "&lt;", ">", "&gt;").Replace(s)
-	}
-	apiKey := esc(cfg.LLMApiKey)
-	baseURL := esc(cfg.LLMBaseURL)
-	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1"
-	}
-	model := esc(cfg.LLMModel)
-	if model == "" {
-		model = "gpt-4o-mini"
-	}
-	feishuID := esc(cfg.FeishuAppID)
-	feishuSecret := esc(cfg.FeishuAppSecret)
-	return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>WILL 配置</title></head><body>
-<h1>WILL 配置</h1>
-<p>LLM 必填，飞书可选。保存后若修改了飞书凭证请重启 WILL 使长连接生效。</p>
-<form method="post">
-  <p><label>LLM API Key <input name="llm_api_key" size="60" placeholder="sk-..." value="` + apiKey + `"></label></p>
-  <p><label>LLM Base URL <input name="llm_base_url" size="60" value="` + baseURL + `"></label></p>
-  <p><label>LLM Model <input name="llm_model" size="30" value="` + model + `"></label></p>
-  <p><label>飞书 App ID <input name="feishu_app_id" size="40" value="` + feishuID + `"></label></p>
-  <p><label>飞书 App Secret <input name="feishu_app_secret" size="50" value="` + feishuSecret + `"></label></p>
-  <p><button type="submit">保存</button></p>
-</form>
-</body></html>`
-}
-
-func handleFeishu(s *store.Store) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var envelope feishu.EventEnvelope
-		if err := json.NewDecoder(r.Body).Decode(&envelope); err != nil {
-			http.Error(w, "invalid json", http.StatusBadRequest)
-			return
-		}
-
-		if envelope.Type == "url_verification" {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
-			return
-		}
-
-		if envelope.Event == nil {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		var ev feishu.IMMessageEvent
-		if err := json.Unmarshal(envelope.Event, &ev); err != nil {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if ev.Message == nil || ev.Sender == nil {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if envelope.Header != nil && envelope.Header.EventType != feishu.EventIMMessageReceive {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		openID := ""
-		if ev.Sender.SenderID != nil {
-			openID = ev.Sender.SenderID.OpenID
-		}
-
-		cfg := config.LoadFromStore(s)
-		if cfg.FeishuAppID == "" || cfg.FeishuAppSecret == "" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		text := feishu.ParseTextContent(ev.Message.Content)
-		if text == "" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		go func() {
-			reply, sendReply := processFeishuMessage(s, openID, ev.Message.MessageID, text)
-			if sendReply && reply != "" {
-				if err := feishu.ReplyMessage(ev.Message.MessageID, reply); err != nil {
-					log.Printf("feishu reply error: %v", err)
+			reply, shouldSend := processFeishuMessage(s, cfg, openID, text, messageID)
+			if shouldSend && reply != "" {
+				if err := feishu.SendMessageToUser(openID, reply); err != nil {
+					log.Printf("[feishu] 发消息失败: %v", err)
+				} else {
+					log.Printf("[feishu] 已发消息给 open_id=%q", openID)
 				}
 			}
-		}()
-
-		w.WriteHeader(http.StatusOK)
+		}); err != nil {
+			log.Fatalf("飞书初始化失败: %v", err)
+		}
+	} else {
+		log.Println("未配置飞书，仅后台运行。")
+		select {} // 保持进程存活
 	}
 }
 
-// processFeishuMessage 处理一条飞书消息（HTTP 与长连接共用），返回回复文案及是否发送回复
-func processFeishuMessage(s *store.Store, openID, messageID, text string) (reply string, sendReply bool) {
-	cfg := config.LoadFromStore(s)
-	if cfg.FeishuAppID == "" || cfg.FeishuAppSecret == "" {
-		return "", false
-	}
-	if len(cfg.FeishuAllowed) == 0 && s != nil && openID != "" {
+func processFeishuMessage(s *store.Store, cfg *config.Config, openID, text, messageID string) (reply string, sendReply bool) {
+	log.Printf("[feishu] 处理文本: %q", text)
+
+	// 首次用户：自动授权
+	if len(cfg.FeishuAllowed) == 0 {
 		_ = s.AddAllowedOpenID(openID)
 		cfg = config.LoadFromStore(s)
-		_, _ = s.AddScheduledTask("do_version_check", "", time.Now().Add(2*time.Minute).Unix())
 	}
+
 	if len(cfg.FeishuAllowed) > 0 && !feishu.IsAllowed(openID, cfg.FeishuAllowed) {
-		reply, sendReply = "未授权用户，忽略。", true
+		return "未授权用户，忽略。", true
+	}
+
+	// 更新回复拦截
+	if tryHandleUpdateReply(s, cfg, openID, text, messageID) {
+		return "", false
+	}
+
+	// 待确认配置变更拦截
+	if rpl, ok := handlePendingConfigConfirm(s, openID, strings.TrimSpace(text)); ok {
+		reply, sendReply = rpl, true
 		goto done
 	}
-	if s != nil && tryHandleUpdateReply(s, cfg, openID, text, messageID) {
-		return "", false // 已在 tryHandleUpdateReply 内回复
+
+	// /compact 需要 LLM，在 main 层处理
+	if strings.ToLower(strings.TrimSpace(text)) == "/compact" {
+		reply, sendReply = compactConversation(s, cfg, openID), true
+		goto done
 	}
-	if s != nil {
-		if rpl, ok := handlePendingConfigConfirm(s, openID, strings.TrimSpace(text)); ok {
-			reply, sendReply = rpl, true
-			goto done
-		}
-	}
+
+	// / 命令
 	if rpl, ok := bot.HandleCommand(text, openID, s, cfg); ok {
 		reply, sendReply = rpl, true
 		goto done
 	}
-	reply, sendReply = runMultiAgent(s, cfg, openID, text), true
+
+	// 自动压缩：对话超过 40 条时先摘要，避免上下文窗口过大
+	if s != nil && s.ConversationCount(openID) >= 40 {
+		if summary, err := llm.CallChat(cfg,
+			"请将以下对话历史压缩为简洁摘要（200字以内），保留关键决定、任务和用户偏好：",
+			buildConvText(s, openID, 50)); err == nil && summary != "" {
+			_ = s.ClearConversation(openID)
+			_ = s.AppendConversation(openID, "system", "[自动压缩摘要] "+summary)
+			log.Printf("[compact] 已自动压缩 open_id=%s 对话历史", openID)
+		}
+	}
+
+	reply, sendReply = runWithLLM(s, cfg, openID, text), true
+
 done:
 	if sendReply && s != nil && openID != "" && reply != "" {
 		_ = s.AppendConversation(openID, "user", text)
@@ -292,130 +160,284 @@ done:
 	return reply, sendReply
 }
 
-const updatePromptMaxAge = 24 * time.Hour
-
-// handlePendingConfigConfirm 若有待确认的配置变更，根据用户回复「确认」/「取消」生效或丢弃，返回 (回复, 是否已处理)
-func handlePendingConfigConfirm(s *store.Store, openID, text string) (reply string, handled bool) {
-	scope := "user:" + openID
-	pending, ok := s.GetMemory(scope, llm.PendingConfigKey)
-	if !ok || pending == "" {
-		return "", false
+// runWithLLM 调用 LLM（Function Calling），executor 负责执行工具
+func runWithLLM(s *store.Store, cfg *config.Config, openID, userMessage string) string {
+	loc := loadLoc(cfg)
+	executor := func(name string, argsJSON []byte) string {
+		return executeTool(s, cfg, openID, loc, name, argsJSON)
 	}
-	lower := strings.ToLower(text)
-	isConfirm := lower == "确认" || lower == "是" || lower == "好" || lower == "可以" || lower == "生效" || lower == "ok" || lower == "yes"
-	isCancel := lower == "取消" || lower == "不" || lower == "否" || lower == "忽略" || lower == "不要" || lower == "no"
-	if isConfirm {
-		var m map[string]string
-		if err := json.Unmarshal([]byte(pending), &m); err != nil {
-			s.SetMemory(scope, llm.PendingConfigKey, "")
-			return "配置解析失败，已清除待确认。", true
-		}
-		for k, v := range m {
-			_ = s.SetConfig(k, v)
-		}
-		s.SetMemory(scope, llm.PendingConfigKey, "")
-		return "配置已生效。", true
+	reply, err := llm.Call(cfg, "user:"+openID, userMessage, s, executor)
+	if err != nil {
+		return "LLM 调用失败 — " + err.Error()
 	}
-	if isCancel {
-		s.SetMemory(scope, llm.PendingConfigKey, "")
-		return "已取消。", true
+	if reply == "" {
+		return "已处理。"
 	}
-	return "请先回复「确认」或「取消」以处理待生效的配置变更。", true
+	return reply
 }
 
-func tryHandleUpdateReply(s *store.Store, cfg *config.Config, openID, text, messageID string) bool {
-	promptAt, _ := s.GetConfig(store.ConfigKeyUpdatePromptAt)
-	if promptAt == "" {
-		return false
+// executeTool 根据工具名分发执行，返回给 LLM 的结果字符串
+func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Location, name string, argsJSON []byte) string {
+	switch name {
+
+	case "todo_list":
+		list, err := s.ListTodos(openID)
+		if err != nil {
+			return "读取待办失败: " + err.Error()
+		}
+		return formatTodoList(list)
+
+	case "todo_add":
+		var p struct{ Title string `json:"title"` }
+		_ = json.Unmarshal(argsJSON, &p)
+		if strings.TrimSpace(p.Title) == "" {
+			return "待办内容不能为空。"
+		}
+		id, err := s.AddTodo(openID, strings.TrimSpace(p.Title))
+		if err != nil {
+			return "添加失败: " + err.Error()
+		}
+		return fmt.Sprintf("已添加待办 [%d] %s", id, p.Title)
+
+	case "todo_done", "todo_delete":
+		var p struct{ Indices string `json:"indices"` }
+		_ = json.Unmarshal(argsJSON, &p)
+		list, err := s.ListTodos(openID)
+		if err != nil {
+			return "读取待办失败: " + err.Error()
+		}
+		ids, indices, errMsg := resolveTodoIndices(p.Indices, list)
+		if errMsg != "" {
+			return errMsg
+		}
+		action := "完成"
+		if name == "todo_done" {
+			for _, id := range ids {
+				_, _ = s.SetTodoStatus(id, openID, "done")
+			}
+		} else {
+			action = "删除"
+			for _, id := range ids {
+				_, _ = s.DeleteTodo(id, openID)
+			}
+		}
+		return fmt.Sprintf("已%s待办 %s。", action, formatIndices(indices))
+
+	case "version_check":
+		return updater.VersionCheckReply(Version)
+
+	case "schedule_list":
+		list, err := s.ListUserScheduledTasks(openID)
+		if err != nil {
+			return "读取定时任务失败: " + err.Error()
+		}
+		return formatScheduleList(list, loc)
+
+	case "schedule_add":
+		var p struct {
+			Instruction string `json:"instruction"`
+			CronExpr    string `json:"cron_expr"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		p.Instruction = strings.TrimSpace(p.Instruction)
+		p.CronExpr = strings.TrimSpace(p.CronExpr)
+		if p.Instruction == "" {
+			return "任务内容不能为空。"
+		}
+		if p.CronExpr == "" {
+			return "cron 表达式不能为空，如 \"0 9 * * *\"（每天9点）。"
+		}
+		nextRun, err := store.NextCronRun(p.CronExpr, time.Now().In(loc))
+		if err != nil {
+			return "cron 表达式无效: " + err.Error()
+		}
+		id, err := s.AddUserScheduledTask(openID, p.Instruction, p.CronExpr, nextRun.Unix())
+		if err != nil {
+			return "添加失败: " + err.Error()
+		}
+		desc := store.CronDescription(p.CronExpr)
+		return fmt.Sprintf("已添加定时任务 [%d]，%s，首次执行 %s。", id, desc, nextRun.In(loc).Format("2006-01-02 15:04"))
+
+	case "schedule_delete":
+		var p struct{ ID string `json:"id"` }
+		_ = json.Unmarshal(argsJSON, &p)
+		id, err := strconv.ParseInt(strings.TrimSpace(p.ID), 10, 64)
+		if err != nil {
+			return "任务编号需为数字。"
+		}
+		ok, err := s.DeleteUserScheduledTask(id, openID)
+		if err != nil {
+			return "删除失败: " + err.Error()
+		}
+		if !ok {
+			return "未找到该任务或无权操作。"
+		}
+		return fmt.Sprintf("已删除定时任务 [%d]。", id)
+
+	case "schedule_update":
+		var p struct {
+			ID          string `json:"id"`
+			Instruction string `json:"instruction"`
+			CronExpr    string `json:"cron_expr"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		id, err := strconv.ParseInt(strings.TrimSpace(p.ID), 10, 64)
+		if err != nil {
+			return "任务编号需为数字。"
+		}
+		task, err := s.GetUserScheduledTaskByID(id, openID)
+		if err != nil || task == nil {
+			return fmt.Sprintf("未找到任务 [%s]。", p.ID)
+		}
+		instruction := task.Instruction
+		cronExpr := task.CronExpr
+		if strings.TrimSpace(p.Instruction) != "" {
+			instruction = strings.TrimSpace(p.Instruction)
+		}
+		if strings.TrimSpace(p.CronExpr) != "" {
+			cronExpr = strings.TrimSpace(p.CronExpr)
+		}
+		nextRun, err := store.NextCronRun(cronExpr, time.Now().In(loc))
+		if err != nil {
+			return "cron 表达式无效: " + err.Error()
+		}
+		ok, err := s.UpdateUserScheduledTask(id, openID, instruction, cronExpr, nextRun.Unix())
+		if err != nil || !ok {
+			return "更新失败。"
+		}
+		desc := store.CronDescription(cronExpr)
+		return fmt.Sprintf("已更新定时任务 [%d]，%s，下次 %s。", id, desc, nextRun.In(loc).Format("2006-01-02 15:04"))
+
+	case "schedule_run_now":
+		var p struct{ ID string `json:"id"` }
+		_ = json.Unmarshal(argsJSON, &p)
+		id, err := strconv.ParseInt(strings.TrimSpace(p.ID), 10, 64)
+		if err != nil {
+			return "任务编号需为数字。"
+		}
+		task, err := s.GetUserScheduledTaskByID(id, openID)
+		if err != nil || task == nil {
+			return fmt.Sprintf("未找到任务 [%s]。", p.ID)
+		}
+		result, err := llm.CallForInstruction(cfg, "user:"+openID, task.Instruction, s)
+		if err != nil {
+			return "执行失败: " + err.Error()
+		}
+		return result
+
+	case "memory_set":
+		var p struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		p.Key = strings.TrimSpace(p.Key)
+		p.Value = strings.TrimSpace(p.Value)
+		if p.Key == "" {
+			return "键名不能为空。"
+		}
+		_ = s.SetMemory("user:"+openID, p.Key, p.Value)
+		return "已记住：" + p.Key + " = " + p.Value
+
+	case "config_change":
+		var p struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		p.Key = strings.TrimSpace(strings.ToLower(p.Key))
+		p.Value = strings.TrimSpace(p.Value)
+		storeKey, ok := llm.AllowedConfigKeys[p.Key]
+		if !ok {
+			return "不支持修改该配置项: " + p.Key
+		}
+		// 写入待确认，等用户回复「确认」
+		pending := map[string]string{storeKey: p.Value}
+		pendingJSON, _ := json.Marshal(pending)
+		_ = s.SetMemory("user:"+openID, llm.PendingConfigKey, string(pendingJSON))
+		return fmt.Sprintf("将修改配置 %s，请回复「确认」生效或「取消」忽略。", p.Key)
+
+	case "shell_exec":
+		var p struct{ Command string `json:"command"` }
+		_ = json.Unmarshal(argsJSON, &p)
+		return runTask(cfg, strings.TrimSpace(p.Command))
+
+	default:
+		return fmt.Sprintf("未知工具: %s", name)
 	}
-	ts, err := strconv.ParseInt(promptAt, 10, 64)
-	if err != nil || time.Since(time.Unix(ts, 0)) > updatePromptMaxAge {
+}
+
+// ── Update handling ───────────────────────────────────────────────────────────
+
+func tryHandleUpdateReply(s *store.Store, cfg *config.Config, openID, text, messageID string) bool {
+	intent, err := llm.ParseUpdateReply(cfg, text)
+	if err != nil || intent.Action == "" {
 		return false
 	}
 	notifyID, _ := s.GetConfig(store.ConfigKeyUpdateNotifyOpenID)
 	if notifyID != "" && notifyID != openID {
 		return false
 	}
-	intent, err := llm.ParseUpdateReply(cfg, text)
-	if err != nil || intent.Action == "" {
-		return false // 消息与更新无关，继续正常处理
-	}
-	s.SetConfig(store.ConfigKeyUpdatePromptAt, "")
-	s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, "")
 	latestVer, _ := s.GetConfig(store.ConfigKeyLatestVersion)
-	assetURL := ""
-
 	switch intent.Action {
 	case "now":
-		_, assetURL, err = updater.CheckLatest()
-		if err != nil {
-			_ = feishu.ReplyMessage(messageID, "获取更新失败 — "+err.Error())
+		_, assetURL, err := updater.CheckLatest()
+		if err != nil || assetURL == "" {
+			_ = feishu.SendMessageToUser(openID, "获取更新失败: "+err.Error())
 			return true
 		}
-		s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, notifyID)
+		_ = feishu.SendMessageToUser(openID, "正在下载更新，完成后将自动重启…")
+		s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, openID)
 		if err := updater.DownloadAndApply(assetURL); err != nil {
 			s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, "")
-			_ = feishu.ReplyMessage(messageID, "更新失败 — "+err.Error())
-			return true
+			_ = feishu.SendMessageToUser(openID, "更新失败: "+err.Error())
 		}
-		_ = feishu.ReplyMessage(messageID, "正在更新并重启…")
-		return true
+	case "skip":
+		_ = s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, "")
+		_ = feishu.SendMessageToUser(openID, "已跳过本次更新。")
 	case "later":
-		hours := intent.RemindHours
-		if hours <= 0 {
-			hours = 24
+		h := intent.RemindHours
+		if h <= 0 {
+			h = 24
 		}
-		payload := `{"version":"` + latestVer + `","open_id":"` + openID + `"}`
-		runAt := time.Now().Add(time.Duration(hours) * time.Hour).Unix()
-		_, _ = s.AddScheduledTask("remind_update", payload, runAt)
-		_ = feishu.ReplyMessage(messageID, "已记录，"+strconv.Itoa(hours)+" 小时后再提醒你。")
-		return true
-	default:
-		_ = feishu.ReplyMessage(messageID, "本次不更新，之后有新版本会再提醒。")
-		return true
+		payload, _ := json.Marshal(map[string]string{"version": latestVer, "open_id": openID})
+		_, _ = s.AddScheduledTask(store.KindRemindUpdate, string(payload), time.Now().Add(time.Duration(h)*time.Hour).Unix())
+		_ = feishu.SendMessageToUser(openID, fmt.Sprintf("好的，%d小时后再提醒你。", h))
 	}
+	return true
 }
 
-func runVersionCheck(s *store.Store) {
-	tick := time.NewTicker(24 * time.Hour)
-	defer tick.Stop()
-	for range tick.C {
-		doVersionCheck(s)
+func handlePendingConfigConfirm(s *store.Store, openID, text string) (reply string, handled bool) {
+	scope := "user:" + openID
+	pendingJSON, ok := s.GetMemory(scope, llm.PendingConfigKey)
+	if !ok || pendingJSON == "" {
+		return "", false
 	}
-}
-
-func doVersionCheck(s *store.Store) {
-	cfg := config.LoadFromStore(s)
-	if cfg.FeishuAppID == "" || cfg.FeishuAppSecret == "" {
-		return
-	}
-	allowed := s.GetAllowedOpenIDs()
-	if len(allowed) == 0 {
-		return
-	}
-	latestVer, _, err := updater.CheckLatest()
-	if err != nil {
-		return
-	}
-	current := strings.TrimPrefix(Version, "v")
-	if !updater.CompareVersion(latestVer, current) {
-		return
-	}
-	promptAt, _ := s.GetConfig(store.ConfigKeyUpdatePromptAt)
-	if promptAt != "" {
-		ts, _ := strconv.ParseInt(promptAt, 10, 64)
-		if time.Since(time.Unix(ts, 0)) < updatePromptMaxAge {
-			return
+	lower := strings.ToLower(strings.TrimSpace(text))
+	confirmWords := []string{"确认", "确定", "好的", "ok", "yes", "是", "同意"}
+	cancelWords := []string{"取消", "不", "no", "否", "算了", "不要", "不用"}
+	for _, w := range confirmWords {
+		if strings.Contains(lower, w) {
+			var pending map[string]string
+			if err := json.Unmarshal([]byte(pendingJSON), &pending); err == nil {
+				for k, v := range pending {
+					_ = s.SetConfig(k, v)
+				}
+			}
+			_ = s.DeleteMemory(scope, llm.PendingConfigKey)
+			return "配置已更新，重启后完全生效。", true
 		}
 	}
-	s.SetConfig(store.ConfigKeyLatestVersion, latestVer)
-	s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
-	s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, allowed[0])
-	msg := "WILL 发现新版本 v" + latestVer + "，是否更新？回复「立即更新」或「稍后再说」或「X 小时后提醒」。"
-	if err := feishu.SendMessageToUser(allowed[0], msg); err != nil {
-		log.Printf("send update prompt: %v", err)
+	for _, w := range cancelWords {
+		if strings.Contains(lower, w) {
+			_ = s.DeleteMemory(scope, llm.PendingConfigKey)
+			return "已取消配置变更。", true
+		}
 	}
+	return "", false
 }
+
+// ── Scheduled task runner ─────────────────────────────────────────────────────
 
 func runScheduledTasks(s *store.Store) {
 	tick := time.NewTicker(time.Minute)
@@ -427,23 +449,23 @@ func runScheduledTasks(s *store.Store) {
 			continue
 		}
 		cfg := config.LoadFromStore(s)
+		loc := loadLoc(cfg)
 		for _, t := range tasks {
 			_ = s.DeleteScheduledTask(t.ID)
 			switch t.Kind {
-			case "do_version_check":
+			case store.KindDoVersionCheck:
 				doVersionCheck(s)
-			case "remind_update":
+			case store.KindRemindUpdate:
 				var payload struct {
 					Version string `json:"version"`
 					OpenID  string `json:"open_id"`
 				}
 				_ = json.Unmarshal([]byte(t.Payload), &payload)
-				if payload.OpenID != "" && cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
+				if payload.OpenID != "" && cfg.FeishuAppID != "" {
 					msg := "WILL 提醒：新版本 v" + payload.Version + " 仍未更新，是否现在更新？回复「立即更新」或「稍后」或「不更新」。"
 					_ = feishu.SendMessageToUser(payload.OpenID, msg)
-					s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
-					s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, payload.OpenID)
-					s.SetConfig(store.ConfigKeyLatestVersion, payload.Version)
+					_ = s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, payload.OpenID)
+					_ = s.SetConfig(store.ConfigKeyLatestVersion, payload.Version)
 				}
 			case store.KindUserScheduled:
 				var p store.UserScheduledPayload
@@ -458,304 +480,67 @@ func runScheduledTasks(s *store.Store) {
 				if cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
 					_ = feishu.SendMessageToUser(t.OpenID, reply)
 				}
-			switch p.Repeat {
-			case "daily":
-				_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, t.RunAt+24*3600, "daily")
-			case "hourly":
-				_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, t.RunAt+3600, "hourly")
-			case "interval":
-				mins := p.IntervalMinutes
-				if mins <= 0 {
-					mins = 60
-				}
-				_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, t.RunAt+int64(mins*60), "interval", mins)
-			}
-			}
-		}
-	}
-}
-
-// runMultiAgent 多智能体：仅当消息明确包含多步操作信号时才走规划+并行+审查流程，否则直接单步执行
-func runMultiAgent(s *store.Store, cfg *config.Config, openID string, userMessage string) string {
-	if !isMultiStepRequest(userMessage) {
-		return runWithLLM(s, cfg, openID, userMessage)
-	}
-	runStep := func(step string) string {
-		return runWithLLM(s, cfg, openID, step)
-	}
-	return orchestrator.Run(cfg, userMessage, runStep)
-}
-
-// isMultiStepRequest 判断消息是否包含多步操作的信号词，避免简单问题走多智能体
-func isMultiStepRequest(text string) bool {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	if lower == "" {
-		return false
-	}
-	// 以下模式是单一操作，不触发多智能体，无论含多少个动词
-	singleOpPatterns := []string{
-		"定时任务", "添加定时", "创建定时", "设置定时", "加个定时",
-		"待办", "新建待办", "添加待办",
-		"检查更新", "查看版本",
-	}
-	for _, p := range singleOpPatterns {
-		if strings.Contains(lower, p) {
-			return false
-		}
-	}
-	signals := []string{
-		"然后", "接着", "之后", "同时", "并且", "另外", "还要", "还需",
-		"，再", "，然后", "，接着", "，同时",
-		"第一步", "第二步", "步骤",
-	}
-	count := 0
-	for _, s := range signals {
-		if strings.Contains(lower, s) {
-			count++
-			if count >= 2 {
-				return true
-			}
-		}
-	}
-	// 包含多个独立操作动词（每个动词前后有边界感）才算多步
-	actionVerbs := []string{"删除", "完成", "检查", "修改", "列出", "搜索"}
-	verbCount := 0
-	for _, v := range actionVerbs {
-		if strings.Contains(lower, v) {
-			verbCount++
-		}
-	}
-	return verbCount >= 2
-}
-
-// runWithLLM 用 LLM 解析用户意图，再按 intent 分发或执行 command/回复（单步，供多智能体调用）
-func runWithLLM(s *store.Store, cfg *config.Config, openID string, userMessage string) string {
-	resp, err := llm.Call(cfg, "user:"+openID, userMessage, s)
-	if err != nil {
-		return "LLM 调用失败 — " + err.Error()
-	}
-	intent := strings.TrimSpace(strings.ToLower(resp.Intent))
-	if s != nil && openID != "" {
-		switch intent {
-		case "todo_list":
-			list, err := s.ListTodos(openID)
-			if err != nil {
-				return "读取待办失败: " + err.Error()
-			}
-			return formatTodoList(list)
-		case "todo_add":
-			title := strings.TrimSpace(resp.TodoTitle)
-			if title == "" {
-				return "未识别到待办内容，请说明要添加什么，如：帮我加个待办买牛奶"
-			}
-			id, err := s.AddTodo(openID, title)
-			if err != nil {
-				return "添加失败: " + err.Error()
-			}
-			return fmt.Sprintf("已添加待办 [%d] %s", id, title)
-		case "todo_done":
-			list, err := s.ListTodos(openID)
-			if err != nil {
-				return "读取待办失败: " + err.Error()
-			}
-			ids, indices, errMsg := parseTodoIndices(strings.TrimSpace(resp.TodoID), list)
-			if errMsg != "" {
-				return errMsg
-			}
-			for _, id := range ids {
-				_, _ = s.SetTodoStatus(id, openID, "done")
-			}
-			return fmt.Sprintf("已将 %s 标为已完成。", formatIndices(indices))
-		case "todo_delete":
-			list, err := s.ListTodos(openID)
-			if err != nil {
-				return "读取待办失败: " + err.Error()
-			}
-			ids, indices, errMsg := parseTodoIndices(strings.TrimSpace(resp.TodoID), list)
-			if errMsg != "" {
-				return errMsg
-			}
-			for _, id := range ids {
-				_, _ = s.DeleteTodo(id, openID)
-			}
-			return fmt.Sprintf("已删除待办 %s。", formatIndices(indices))
-		case "schedule_list":
-			list, err := s.ListUserScheduledTasks(openID)
-			if err != nil {
-				return "读取定时任务失败: " + err.Error()
-			}
-			return formatScheduleList(list)
-		case "schedule_add":
-			instruction := strings.TrimSpace(resp.ScheduleInstruction)
-			if instruction == "" {
-				return "未识别到任务内容，请说明要定时做什么，如：每天9点先查待办再搜今日科技新闻"
-			}
-			repeat := strings.TrimSpace(strings.ToLower(resp.ScheduleRepeat))
-			// 多时间点（schedule_run_at_list 非空）：批量创建每日定时任务
-			if runAtList := strings.TrimSpace(resp.ScheduleRunAtList); runAtList != "" {
-				parts := strings.FieldsFunc(runAtList, func(r rune) bool { return r == ',' || r == '，' || r == ' ' })
-				var addedTimes []string
-				for _, p := range parts {
-					p = strings.TrimSpace(p)
-					if p == "" {
-						continue
-					}
-					ts, err := parseDailyTime(p)
-					if err != nil {
-						continue
-					}
-					id, err := s.AddUserScheduledTask(openID, instruction, ts, "daily")
+				// 用 cron 表达式计算下次执行时间
+				if p.CronExpr != "" {
+					nextRun, err := store.NextCronRun(p.CronExpr, time.Now().In(loc))
 					if err == nil {
-						addedTimes = append(addedTimes, fmt.Sprintf("[%d]%s", id, time.Unix(ts, 0).Format("15:04")))
+						_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, p.CronExpr, nextRun.Unix())
 					}
 				}
-				if len(addedTimes) == 0 {
-					return "时间解析失败，请说明具体时间，如：06:00,11:30,17:30"
-				}
-				return "已添加 " + strconv.Itoa(len(addedTimes)) + " 个每日定时任务：" + strings.Join(addedTimes, " ")
 			}
-			// interval 间隔任务
-			if repeat == "interval" {
-				mins := 0
-				if minsStr := strings.TrimSpace(resp.ScheduleIntervalMins); minsStr != "" {
-					mins, _ = strconv.Atoi(minsStr)
-				}
-				if mins <= 0 {
-					mins = 60
-				}
-				runAt, _ := parseScheduleRunAt("", "interval", mins)
-				id, err := s.AddUserScheduledTask(openID, instruction, runAt, "interval", mins)
-				if err != nil {
-					return "添加定时任务失败: " + err.Error()
-				}
-				h, m := mins/60, mins%60
-				label := ""
-				if h > 0 && m > 0 {
-					label = fmt.Sprintf("每%d小时%d分钟", h, m)
-				} else if h > 0 {
-					label = fmt.Sprintf("每%d小时", h)
-				} else {
-					label = fmt.Sprintf("每%d分钟", mins)
-				}
-				return fmt.Sprintf("已添加定时任务 [%d]，%s执行，首次 %s。", id, label, time.Unix(runAt, 0).Format("15:04"))
-			}
-			// 单时间（hourly / daily / 单次）
-			runAt, err := parseScheduleRunAt(strings.TrimSpace(resp.ScheduleRunAt), repeat)
-			if err != nil {
-				return "时间解析失败，请说明具体时间，如：明天9点、每天09:00 — " + err.Error()
-			}
-			finalRepeat := ""
-			switch repeat {
-			case "daily", "hourly":
-				finalRepeat = repeat
-			}
-			id, err := s.AddUserScheduledTask(openID, instruction, runAt, finalRepeat)
-			if err != nil {
-				return "添加定时任务失败: " + err.Error()
-			}
-			return fmt.Sprintf("已添加定时任务 [%d]，执行时间 %s。", id, time.Unix(runAt, 0).Format("2006-01-02 15:04"))
-		case "schedule_delete":
-			idStr := strings.TrimSpace(resp.ScheduleID)
-			if idStr == "" {
-				return "请说明要删除哪条定时任务（编号）。"
-			}
-			id, err := strconv.ParseInt(idStr, 10, 64)
-			if err != nil {
-				return "任务编号需为数字。"
-			}
-			ok, err := s.DeleteUserScheduledTask(id, openID)
-			if err != nil {
-				return "删除失败: " + err.Error()
-			}
-			if !ok {
-				return "未找到该任务或无权操作。"
-			}
-			return fmt.Sprintf("已删除定时任务 [%d]。", id)
-		case "schedule_update":
-			idStr := strings.TrimSpace(resp.ScheduleID)
-			if idStr == "" {
-				return "请说明要修改哪条定时任务（编号）。"
-			}
-			id, err := strconv.ParseInt(idStr, 10, 64)
-			if err != nil {
-				return "任务编号需为数字。"
-			}
-			instruction := strings.TrimSpace(resp.ScheduleInstruction)
-			repeat := strings.TrimSpace(strings.ToLower(resp.ScheduleRepeat))
-			runAt := int64(0)
-			if resp.ScheduleRunAt != "" {
-				runAt, err = parseScheduleRunAt(strings.TrimSpace(resp.ScheduleRunAt), repeat)
-				if err != nil {
-					return "时间解析失败: " + err.Error()
-				}
-			}
-			if instruction == "" && runAt == 0 {
-				return "请说明要修改的内容（任务说明或执行时间）。"
-			}
-			list, _ := s.ListUserScheduledTasks(openID)
-			var currentRunAt int64
-			for _, t := range list {
-				if t.ID == id {
-					currentRunAt = t.RunAt
-					break
-				}
-			}
-			if runAt == 0 {
-				runAt = currentRunAt
-			}
-			rep := ""
-			if repeat == "daily" {
-				rep = "daily"
-			}
-			for _, t := range list {
-				if t.ID == id {
-					if instruction == "" {
-						instruction = t.Instruction
-					}
-					if rep == "" {
-						rep = t.Repeat
-					}
-					break
-				}
-			}
-			ok, err := s.UpdateUserScheduledTask(id, openID, instruction, runAt, rep)
-			if err != nil {
-				return "更新失败: " + err.Error()
-			}
-			if !ok {
-				return "未找到该任务或无权操作。"
-			}
-			return fmt.Sprintf("已更新定时任务 [%d]。", id)
-		case "version_check":
-			reply := updater.VersionCheckReply(Version)
-			if strings.Contains(reply, "发现新版本") {
-				latestVer, _, _ := updater.CheckLatest()
-				if latestVer != "" {
-					s.SetConfig(store.ConfigKeyLatestVersion, latestVer)
-					s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
-					s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, openID)
-				}
-			}
-			return reply
 		}
 	}
-	command, replyText := llm.Apply(s, openID, resp)
-	if command != "" {
-		out := runTask(cfg, command)
-		if replyText != "" {
-			return replyText + "\n\n" + out
+}
+
+func doVersionCheck(s *store.Store) {
+	latestVer, assetURL, err := updater.CheckLatest()
+	if err != nil {
+		log.Printf("[updater] 检查更新失败: %v", err)
+		return
+	}
+	_ = s.SetConfig(store.ConfigKeyLatestVersion, latestVer)
+	if !updater.CompareVersion(latestVer, Version) {
+		return
+	}
+	if assetURL == "" {
+		return
+	}
+	notifyID, _ := s.GetConfig(store.ConfigKeyUpdateNotifyOpenID)
+	if notifyID == "" {
+		ids := s.GetAllowedOpenIDs()
+		if len(ids) > 0 {
+			notifyID = ids[0]
 		}
-		return out
 	}
-	if replyText != "" {
-		return replyText
+	if notifyID == "" {
+		return
 	}
-	return "已处理。"
+	msg := fmt.Sprintf("发现新版本 v%s，回复「立即更新」可更新，「稍后N小时」可延后提醒。", latestVer)
+	_ = feishu.SendMessageToUser(notifyID, msg)
+	_ = s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, notifyID)
+	_ = s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func loadLoc(cfg *config.Config) *time.Location {
+	tz := "Asia/Shanghai"
+	if cfg != nil && cfg.Timezone != "" {
+		tz = cfg.Timezone
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil || loc == nil {
+		loc, _ = time.LoadLocation("Asia/Shanghai")
+		if loc == nil {
+			loc = time.UTC
+		}
+	}
+	return loc
 }
 
 func formatTodoList(list []store.Todo) string {
 	if len(list) == 0 {
-		return "当前无待办。说「添加待办 xxx」或发 /todo add xxx 添加。"
+		return "当前无待办。"
 	}
 	var b strings.Builder
 	b.WriteString("待办列表：\n")
@@ -766,30 +551,41 @@ func formatTodoList(list []store.Todo) string {
 		}
 		b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", i+1, t.Title, status))
 	}
-	b.WriteString("\n说「完成1」或「删除待办1、2」；序号从 1 开始，可多个用逗号分隔")
-	return b.String()
+	return strings.TrimRight(b.String(), "\n")
 }
 
-// parseTodoIndices 解析 todo_id 字符串（如 "1,2,3" 或 "1 2"）为实际 id 列表；list 为当前待办列表，序号从 1 开始。返回 (ids, 用于回复的序号文案, 错误信息)
-func parseTodoIndices(todoIDStr string, list []store.Todo) (ids []int64, indices []int, errMsg string) {
-	if todoIDStr == "" {
-		return nil, nil, "请说明要操作哪条待办（序号 1、2、3…，多条用逗号分隔如 1,2）。"
+func formatScheduleList(list []store.UserScheduledTask, loc *time.Location) string {
+	if loc == nil {
+		loc = time.Local
 	}
-	parts := strings.FieldsFunc(todoIDStr, func(r rune) bool { return r == ',' || r == '，' || r == ' ' || r == '、' })
+	if len(list) == 0 {
+		return "当前无定时任务。"
+	}
+	var b strings.Builder
+	b.WriteString("定时任务列表：\n")
+	for _, t := range list {
+		desc := store.CronDescription(t.CronExpr)
+		if desc == t.CronExpr {
+			desc = t.CronExpr
+		}
+		next := time.Unix(t.RunAt, 0).In(loc).Format("2006-01-02 15:04")
+		b.WriteString(fmt.Sprintf("[%d] %s（下次 %s）— %s\n", t.ID, desc, next, t.Instruction))
+	}
+	b.WriteString("\n说「删除定时任务 2」或「修改定时任务 2 改为每天10点」")
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func resolveTodoIndices(indicesStr string, list []store.Todo) (ids []int64, indices []int, errMsg string) {
+	if indicesStr == "" {
+		return nil, nil, "请指定待办序号（1开始，多个逗号分隔，如 1 或 1,2）。"
+	}
+	parts := strings.FieldsFunc(indicesStr, func(r rune) bool {
+		return r == ',' || r == '，' || r == ' ' || r == '、'
+	})
 	seen := make(map[int]bool)
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 1 {
-			return nil, nil, "待办序号需为正整数（1、2、3…）。"
-		}
-		if n > len(list) {
-			return nil, nil, fmt.Sprintf("当前只有 %d 条待办，没有序号 %d。", len(list), n)
-		}
-		if seen[n] {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || n < 1 || n > len(list) || seen[n] {
 			continue
 		}
 		seen[n] = true
@@ -797,7 +593,7 @@ func parseTodoIndices(todoIDStr string, list []store.Todo) (ids []int64, indices
 		indices = append(indices, n)
 	}
 	if len(ids) == 0 {
-		return nil, nil, "未识别到有效序号，请说如：删除1、2 或 完成1。"
+		return nil, nil, fmt.Sprintf("序号需在 1 到 %d 之间。", len(list))
 	}
 	return ids, indices, ""
 }
@@ -806,121 +602,24 @@ func formatIndices(indices []int) string {
 	if len(indices) == 0 {
 		return ""
 	}
-	if len(indices) == 1 {
-		return fmt.Sprintf("%d", indices[0])
+	parts := make([]string, len(indices))
+	for i, n := range indices {
+		parts[i] = strconv.Itoa(n)
 	}
-	return strings.Trim(strings.Replace(fmt.Sprint(indices), " ", "、", -1), "[]")
-}
-
-func formatScheduleList(list []store.UserScheduledTask) string {
-	if len(list) == 0 {
-		return "当前无定时任务。说「添加定时任务：每天9点查待办」等即可添加。"
-	}
-	var b strings.Builder
-	b.WriteString("定时任务列表：\n")
-	for _, t := range list {
-		when := "下次 " + time.Unix(t.RunAt, 0).Format("2006-01-02 15:04")
-		switch t.Repeat {
-		case "daily":
-			when = "每天 " + time.Unix(t.RunAt, 0).Format("15:04")
-		case "hourly":
-			when = "每小时（下次 " + time.Unix(t.RunAt, 0).Format("15:04") + "）"
-		case "interval":
-			h := t.IntervalMinutes / 60
-			m := t.IntervalMinutes % 60
-			label := ""
-			if h > 0 && m > 0 {
-				label = fmt.Sprintf("每%d小时%d分钟", h, m)
-			} else if h > 0 {
-				label = fmt.Sprintf("每%d小时", h)
-			} else {
-				label = fmt.Sprintf("每%d分钟", t.IntervalMinutes)
-			}
-			when = label + "（下次 " + time.Unix(t.RunAt, 0).Format("15:04") + "）"
-		}
-		b.WriteString(fmt.Sprintf("[%d] %s — %s\n", t.ID, when, t.Instruction))
-	}
-	b.WriteString("\n说「删除定时任务 1」或「修改定时任务 2 改为每天10点」")
-	return b.String()
-}
-
-// parseDailyTime 解析 "09:00" "9:0" 等格式，返回当天（若已过则明天）的 Unix 时间戳
-func parseDailyTime(runAt string) (int64, error) {
-	now := time.Now()
-	for _, layout := range []string{"15:04", "15:4", "1:04", "1:4"} {
-		t, err := time.ParseInLocation(layout, runAt, now.Location())
-		if err != nil {
-			continue
-		}
-		next := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
-		if !next.After(now) {
-			next = next.Add(24 * time.Hour)
-		}
-		return next.Unix(), nil
-	}
-	return 0, fmt.Errorf("每日时间格式应为 09:00 或 9:00")
-}
-
-// parseScheduleRunAt 解析执行时间；repeat 为 "daily"、"hourly"、"interval" 或空（单次）
-// intervalMins 仅 repeat="interval" 时有效
-func parseScheduleRunAt(runAt, repeat string, intervalMins ...int) (int64, error) {
-	now := time.Now()
-	switch repeat {
-	case "hourly":
-		if runAt == "" || strings.ToLower(runAt) == "now" || strings.ToLower(runAt) == "现在" {
-			return now.Add(time.Hour).Unix(), nil
-		}
-		for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04", "15:04"} {
-			t, err := time.ParseInLocation(layout, runAt, now.Location())
-			if err != nil {
-				continue
-			}
-			if layout == "15:04" {
-				t = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
-				if !t.After(now) {
-					t = t.Add(time.Hour)
-				}
-			}
-			return t.Unix(), nil
-		}
-		return now.Add(time.Hour).Unix(), nil
-	case "interval":
-		mins := 0
-		if len(intervalMins) > 0 {
-			mins = intervalMins[0]
-		}
-		if mins <= 0 {
-			mins = 60
-		}
-		return now.Add(time.Duration(mins) * time.Minute).Unix(), nil
-	case "daily":
-		return parseDailyTime(runAt)
-	default:
-		for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04"} {
-			t, err := time.ParseInLocation(layout, runAt, now.Location())
-			if err != nil {
-				continue
-			}
-			return t.Unix(), nil
-		}
-		return 0, fmt.Errorf("时间格式应为 2006-01-02T09:00:00 或 2006-01-02 09:00")
-	}
+	return strings.Join(parts, "、")
 }
 
 func runTask(cfg *config.Config, instruction string) string {
-	instruction = strings.TrimSpace(instruction)
 	if instruction == "" {
 		return "收到空指令。"
 	}
-	// 拦截 git 命令，避免在非 git 目录报错；检查版本请说「检查新版本」
 	firstWord := instruction
 	if i := strings.IndexAny(instruction, " \t"); i > 0 {
 		firstWord = instruction[:i]
 	}
 	if strings.ToLower(firstWord) == "git" {
-		return "检查版本请说「检查新版本」，按 GitHub 发布版本检查，无需 git。"
+		return "检查版本请说「检查新版本」，无需 git。"
 	}
-
 	if cfg.Mode == config.ModeMain && len(cfg.WorkerURLs) > 0 && cfg.InternalToken != "" {
 		workerURL := strings.TrimRight(cfg.WorkerURLs[0], "/")
 		client := internalapi.NewClient(workerURL, cfg.InternalToken)
@@ -935,9 +634,108 @@ func runTask(cfg *config.Config, instruction string) string {
 		}
 		return resp.Stdout
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	res := exec.Run(ctx, instruction, "", 5*time.Minute)
 	return res.String()
+}
+
+// orchestrator 入口：复杂多步任务用规划-执行-审查，简单任务直接 runWithLLM
+func runMultiAgent(s *store.Store, cfg *config.Config, openID, userMessage string) string {
+	if !isMultiStepRequest(userMessage) {
+		return runWithLLM(s, cfg, openID, userMessage)
+	}
+	runStep := func(step string) string {
+		return runWithLLM(s, cfg, openID, step)
+	}
+	return orchestrator.Run(cfg, userMessage, runStep)
+}
+
+func isMultiStepRequest(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	singleOp := []string{"定时任务", "待办", "版本", "配置", "记忆", "执行"}
+	for _, p := range singleOp {
+		if strings.Contains(lower, p) {
+			return false
+		}
+	}
+	signals := []string{"然后", "接着", "之后", "同时", "第一步", "第二步"}
+	count := 0
+	for _, sig := range signals {
+		if strings.Contains(lower, sig) {
+			count++
+			if count >= 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ── /compact（参考 OpenClaw /compact，AI 摘要压缩对话历史）─────────────────────
+
+// compactConversation 用 LLM 将对话历史压缩为摘要，清空旧记录并写入摘要条目
+func compactConversation(s *store.Store, cfg *config.Config, openID string) string {
+	if s == nil {
+		return "未启用本地存储。"
+	}
+	count := s.ConversationCount(openID)
+	if count < 6 {
+		return fmt.Sprintf("对话记录较短（%d 条），无需压缩。", count)
+	}
+	convText := buildConvText(s, openID, 50)
+	summary, err := llm.CallChat(cfg,
+		"请将以下对话历史压缩为简洁摘要（200字以内），保留关键决定、任务目标和用户偏好：",
+		convText)
+	if err != nil {
+		return "压缩失败: " + err.Error()
+	}
+	_ = s.ClearConversation(openID)
+	_ = s.AppendConversation(openID, "system", "[对话摘要] "+summary)
+	return fmt.Sprintf("已压缩对话历史（%d 条 → 1 条摘要）。\n摘要：%s", count, summary)
+}
+
+// buildConvText 将最近 n 条对话格式化为文本供 LLM 摘要
+func buildConvText(s *store.Store, openID string, n int) string {
+	history, _ := s.GetRecentConversation(openID, n)
+	var b strings.Builder
+	for _, m := range history {
+		role := "用户"
+		if m.Role == "assistant" {
+			role = "助手"
+		} else if m.Role == "system" {
+			role = "系统"
+		}
+		b.WriteString(role + ": " + m.Content + "\n")
+	}
+	return b.String()
+}
+
+// ── HTTP worker handler (worker 模式) ─────────────────────────────────────────
+
+func startWorkerHTTP(s *store.Store, cfg *config.Config) {
+	mux := http.NewServeMux()
+	internalapi.RegisterHandler(mux, cfg, func(cmd, workdir string, timeout int) (string, string, string) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+		defer cancel()
+		res := exec.Run(ctx, cmd, workdir, time.Duration(timeout)*time.Second)
+		return res.Stdout, res.Stderr, res.Error
+	})
+	addr := cfg.Bind + ":" + cfg.Port
+	log.Printf("[worker] 监听 %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("[worker] HTTP 服务失败: %v", err)
+	}
+}
+
+func init() {
+	// worker 模式下从环境变量判断
+	if os.Getenv("WILL_MODE") == "worker" {
+		cfg := config.Load()
+		s, _ := store.Open("")
+		go startWorkerHTTP(s, cfg)
+	}
 }

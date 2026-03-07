@@ -20,25 +20,25 @@ type Config struct {
 	Bind string
 	Port string
 
-	LLMApiKey       string
-	LLMBaseURL      string
-	LLMModel        string
+	LLMApiKey  string
+	LLMBaseURL string
+	LLMModel   string
 
-	FeishuAppID     string
-	FeishuAppSecret string
-	FeishuAllowed   []string
+	FeishuAppID         string
+	FeishuAppSecret     string
+	FeishuAllowed       []string
+	FeishuSubscribeMode string // "webhook" | "ws"
 
-	InternalToken    string
-	WorkerURLs       []string
-	FeishuSubscribeMode string // "webhook" | "ws"，默认 ws（长连接）
+	InternalToken string
+	WorkerURLs    []string
+
+	Timezone string // IANA 时区，默认 Asia/Shanghai
 }
 
-// Load 仅从环境变量加载（worker 模式或未提供 store 时）
 func Load() *Config {
 	return loadFrom(nil)
 }
 
-// LoadFromStore 从 SQLite + 环境变量合并加载（env 优先）
 func LoadFromStore(s *store.Store) *Config {
 	return loadFrom(s)
 }
@@ -71,8 +71,7 @@ func loadFrom(s *store.Store) *Config {
 	if len(allowed) == 0 {
 		if v := os.Getenv("FEISHU_ALLOWED_OPEN_IDS"); v != "" {
 			for _, id := range strings.Split(v, ",") {
-				id = strings.TrimSpace(id)
-				if id != "" {
+				if id = strings.TrimSpace(id); id != "" {
 					allowed = append(allowed, id)
 				}
 			}
@@ -82,31 +81,30 @@ func loadFrom(s *store.Store) *Config {
 	var workerURLs []string
 	if urls := get("WILL_WORKER_URLS", store.ConfigKeyWorkerURLs, ""); urls != "" {
 		for _, u := range strings.Split(urls, ",") {
-			u = strings.TrimSpace(u)
-			if u != "" {
+			if u = strings.TrimSpace(u); u != "" {
 				workerURLs = append(workerURLs, u)
 			}
 		}
 	}
 
-	internalToken := get("WILL_INTERNAL_TOKEN", store.ConfigKeyInternalToken, "")
 	subscribeMode := get("FEISHU_SUBSCRIBE_MODE", store.ConfigKeyFeishuSubscribeMode, "ws")
 	if subscribeMode != "webhook" {
 		subscribeMode = "ws"
 	}
 
 	return &Config{
-		Mode:            mode,
-		Bind:            bind,
-		Port:            port,
-		LLMApiKey:       get("OPENAI_API_KEY", store.ConfigKeyLLMApiKey, ""),
-		LLMBaseURL:      get("OPENAI_BASE_URL", store.ConfigKeyLLMBaseURL, "https://api.openai.com/v1"),
-		LLMModel:        get("OPENAI_MODEL", store.ConfigKeyLLMModel, "gpt-4o-mini"),
-		FeishuAppID:     get("FEISHU_APP_ID", store.ConfigKeyFeishuAppID, ""),
-		FeishuAppSecret: get("FEISHU_APP_SECRET", store.ConfigKeyFeishuAppSecret, ""),
-		FeishuAllowed:   allowed,
-		InternalToken:       internalToken,
-		WorkerURLs:          workerURLs,
+		Mode:                mode,
+		Bind:                bind,
+		Port:                port,
+		LLMApiKey:           get("OPENAI_API_KEY", store.ConfigKeyLLMApiKey, ""),
+		LLMBaseURL:          get("OPENAI_BASE_URL", store.ConfigKeyLLMBaseURL, "https://api.openai.com/v1"),
+		LLMModel:            get("OPENAI_MODEL", store.ConfigKeyLLMModel, "gpt-4o-mini"),
+		FeishuAppID:         get("FEISHU_APP_ID", store.ConfigKeyFeishuAppID, ""),
+		FeishuAppSecret:     get("FEISHU_APP_SECRET", store.ConfigKeyFeishuAppSecret, ""),
+		FeishuAllowed:       allowed,
 		FeishuSubscribeMode: subscribeMode,
+		InternalToken:       get("WILL_INTERNAL_TOKEN", store.ConfigKeyInternalToken, ""),
+		WorkerURLs:          workerURLs,
+		Timezone:            get("WILL_TIMEZONE", store.ConfigKeyTimezone, "Asia/Shanghai"),
 	}
 }
