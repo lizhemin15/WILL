@@ -24,6 +24,9 @@ func CreateTask(openID, title string) (string, error) {
 		UserIdType("open_id").
 		Task(larktask.NewTaskBuilder().
 			Summary(title).
+			Origin(larktask.NewOriginBuilder().
+				PlatformI18nName(`{"zh_cn":"WILL 助手","en_us":"WILL"}`).
+				Build()).
 			CollaboratorIds([]string{openID}).
 			Build()).
 		Build()
