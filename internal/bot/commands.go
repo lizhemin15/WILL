@@ -308,15 +308,24 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if len(ids) == 0 {
 			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-		for i, id := range ids {
-			_, _ = s.DeleteTodo(id, openID)
-			if list[indices[i]-1].FeishuTaskID != "" {
-				if ferr := feishu.DeleteTask(list[indices[i]-1].FeishuTaskID); ferr != nil {
-					log.Printf("[todo] 删除飞书任务失败: %v", ferr)
-				}
+	var feishuErrs []string
+	for i, id := range ids {
+		_, _ = s.DeleteTodo(id, openID)
+		taskID := list[indices[i]-1].FeishuTaskID
+		if taskID != "" {
+			if ferr := feishu.DeleteTask(taskID); ferr != nil {
+				log.Printf("[todo] 删除飞书任务 %s 失败: %v", taskID, ferr)
+				feishuErrs = append(feishuErrs, ferr.Error())
 			}
+		} else {
+			feishuErrs = append(feishuErrs, "该待办未绑定飞书任务ID")
 		}
-		return fmt.Sprintf("已删除待办 %s。", formatTodoIndices(indices))
+	}
+	result := fmt.Sprintf("已删除待办 %s。", formatTodoIndices(indices))
+	if len(feishuErrs) > 0 {
+		result += "（飞书同步: " + strings.Join(feishuErrs, "; ") + "）"
+	}
+	return result
 	default:
 		return "用法: /todo [list|add <内容>|done 1 2|delete 1 2]"
 	}

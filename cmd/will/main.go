@@ -228,13 +228,15 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 			return errMsg
 		}
 		action := "完成"
+		var feishuErrs []string
 		if name == "todo_done" {
 			for i, id := range ids {
 				_, _ = s.SetTodoStatus(id, openID, "done")
-				// 同步到飞书任务中心
-				if list[indices[i]-1].FeishuTaskID != "" {
-					if ferr := feishu.CompleteTask(list[indices[i]-1].FeishuTaskID); ferr != nil {
-						log.Printf("[todo] 完成飞书任务失败: %v", ferr)
+				taskID := list[indices[i]-1].FeishuTaskID
+				if taskID != "" {
+					if ferr := feishu.CompleteTask(taskID); ferr != nil {
+						log.Printf("[todo] 完成飞书任务 %s 失败: %v", taskID, ferr)
+						feishuErrs = append(feishuErrs, ferr.Error())
 					}
 				}
 			}
@@ -242,15 +244,22 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 			action = "删除"
 			for i, id := range ids {
 				_, _ = s.DeleteTodo(id, openID)
-				// 同步到飞书任务中心
-				if list[indices[i]-1].FeishuTaskID != "" {
-					if ferr := feishu.DeleteTask(list[indices[i]-1].FeishuTaskID); ferr != nil {
-						log.Printf("[todo] 删除飞书任务失败: %v", ferr)
+				taskID := list[indices[i]-1].FeishuTaskID
+				if taskID != "" {
+					if ferr := feishu.DeleteTask(taskID); ferr != nil {
+						log.Printf("[todo] 删除飞书任务 %s 失败: %v", taskID, ferr)
+						feishuErrs = append(feishuErrs, ferr.Error())
 					}
+				} else {
+					feishuErrs = append(feishuErrs, "该待办未绑定飞书任务ID，无法同步删除")
 				}
 			}
 		}
-		return fmt.Sprintf("已%s待办 %s。", action, formatIndices(indices))
+		result := fmt.Sprintf("已%s待办 %s。", action, formatIndices(indices))
+		if len(feishuErrs) > 0 {
+			result += "（飞书同步: " + strings.Join(feishuErrs, "; ") + "）"
+		}
+		return result
 
 	case "version_check":
 		return updater.VersionCheckReply(Version)
