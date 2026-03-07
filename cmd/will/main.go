@@ -200,11 +200,18 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		if strings.TrimSpace(p.Title) == "" {
 			return "待办内容不能为空。"
 		}
-		id, err := s.AddTodo(openID, strings.TrimSpace(p.Title))
+		title := strings.TrimSpace(p.Title)
+		localID, err := s.AddTodo(openID, title)
 		if err != nil {
 			return "添加失败: " + err.Error()
 		}
-		return fmt.Sprintf("已添加待办 [%d] %s", id, p.Title)
+		// 同步到飞书任务中心
+		if taskID, ferr := feishu.CreateTask(openID, title); ferr == nil && taskID != "" {
+			_ = s.SetFeishuTaskID(localID, taskID)
+		} else if ferr != nil {
+			log.Printf("[todo] 创建飞书任务失败（本地已保存）: %v", ferr)
+		}
+		return fmt.Sprintf("已添加待办 [%d] %s（已同步至飞书任务）", localID, title)
 
 	case "todo_done", "todo_delete":
 		var p struct{ Indices string `json:"indices"` }
@@ -219,13 +226,25 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		}
 		action := "完成"
 		if name == "todo_done" {
-			for _, id := range ids {
+			for i, id := range ids {
 				_, _ = s.SetTodoStatus(id, openID, "done")
+				// 同步到飞书任务中心
+				if list[indices[i]-1].FeishuTaskID != "" {
+					if ferr := feishu.CompleteTask(list[indices[i]-1].FeishuTaskID); ferr != nil {
+						log.Printf("[todo] 完成飞书任务失败: %v", ferr)
+					}
+				}
 			}
 		} else {
 			action = "删除"
-			for _, id := range ids {
+			for i, id := range ids {
 				_, _ = s.DeleteTodo(id, openID)
+				// 同步到飞书任务中心
+				if list[indices[i]-1].FeishuTaskID != "" {
+					if ferr := feishu.DeleteTask(list[indices[i]-1].FeishuTaskID); ferr != nil {
+						log.Printf("[todo] 删除飞书任务失败: %v", ferr)
+					}
+				}
 			}
 		}
 		return fmt.Sprintf("已%s待办 %s。", action, formatIndices(indices))
@@ -552,11 +571,15 @@ func formatTodoList(list []store.Todo) string {
 	var b strings.Builder
 	b.WriteString("待办列表：\n")
 	for i, t := range list {
-		status := "未完成"
+		status := "⬜ 未完成"
 		if t.Status == "done" {
-			status = "已完成"
+			status = "✅ 已完成"
 		}
-		b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", i+1, t.Title, status))
+		sync := ""
+		if t.FeishuTaskID != "" {
+			sync = " 📋"
+		}
+		b.WriteString(fmt.Sprintf("[%d] %s (%s)%s\n", i+1, t.Title, status, sync))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

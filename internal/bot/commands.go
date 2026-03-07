@@ -2,10 +2,12 @@ package bot
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
 	"github.com/yourusername/will/internal/config"
+	"github.com/yourusername/will/internal/feishu"
 	"github.com/yourusername/will/internal/store"
 )
 
@@ -260,11 +262,16 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if title == "" {
 			return "待办内容不能为空。"
 		}
-		id, err := s.AddTodo(openID, title)
+		localID, err := s.AddTodo(openID, title)
 		if err != nil {
 			return "添加失败: " + err.Error()
 		}
-		return fmt.Sprintf("已添加待办 [%d] %s", id, title)
+		if taskID, ferr := feishu.CreateTask(openID, title); ferr == nil && taskID != "" {
+			_ = s.SetFeishuTaskID(localID, taskID)
+		} else if ferr != nil {
+			log.Printf("[todo] 创建飞书任务失败（本地已保存）: %v", ferr)
+		}
+		return fmt.Sprintf("已添加待办 [%d] %s（已同步至飞书任务）", localID, title)
 	case "done":
 		if len(args) < 2 {
 			return "用法: /todo done <序号> 或 /todo done 1 2 3"
@@ -277,8 +284,13 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if len(ids) == 0 {
 			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-		for _, id := range ids {
+		for i, id := range ids {
 			_, _ = s.SetTodoStatus(id, openID, "done")
+			if list[indices[i]-1].FeishuTaskID != "" {
+				if ferr := feishu.CompleteTask(list[indices[i]-1].FeishuTaskID); ferr != nil {
+					log.Printf("[todo] 完成飞书任务失败: %v", ferr)
+				}
+			}
 		}
 		return fmt.Sprintf("已将 %s 标为已完成。", formatTodoIndices(indices))
 	case "delete":
@@ -293,8 +305,13 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if len(ids) == 0 {
 			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-		for _, id := range ids {
+		for i, id := range ids {
 			_, _ = s.DeleteTodo(id, openID)
+			if list[indices[i]-1].FeishuTaskID != "" {
+				if ferr := feishu.DeleteTask(list[indices[i]-1].FeishuTaskID); ferr != nil {
+					log.Printf("[todo] 删除飞书任务失败: %v", ferr)
+				}
+			}
 		}
 		return fmt.Sprintf("已删除待办 %s。", formatTodoIndices(indices))
 	default:

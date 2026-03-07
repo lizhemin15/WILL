@@ -88,6 +88,8 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
+	// 幂等地添加 feishu_task_id 列（已存在时忽略错误）
+	_, _ = s.db.Exec(`ALTER TABLE todos ADD COLUMN feishu_task_id TEXT NOT NULL DEFAULT ''`)
 	return nil
 }
 
@@ -185,11 +187,12 @@ func (s *Store) ListMemory(scope string) (map[string]string, error) {
 // ── Todos ─────────────────────────────────────────────────────────────────────
 
 type Todo struct {
-	ID        int64
-	OpenID    string
-	Title     string
-	Status    string
-	CreatedAt int64
+	ID           int64
+	OpenID       string
+	Title        string
+	Status       string
+	CreatedAt    int64
+	FeishuTaskID string
 }
 
 func (s *Store) AddTodo(openID, title string) (int64, error) {
@@ -204,10 +207,18 @@ func (s *Store) AddTodo(openID, title string) (int64, error) {
 	return id, nil
 }
 
+// SetFeishuTaskID 将本地待办与飞书任务 ID 绑定
+func (s *Store) SetFeishuTaskID(todoID int64, feishuTaskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("UPDATE todos SET feishu_task_id=? WHERE id=?", feishuTaskID, todoID)
+	return err
+}
+
 func (s *Store) ListTodos(openID string) ([]Todo, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query("SELECT id,open_id,title,status,created_at FROM todos WHERE open_id=? ORDER BY id", openID)
+	rows, err := s.db.Query("SELECT id,open_id,title,status,created_at,COALESCE(feishu_task_id,'') FROM todos WHERE open_id=? ORDER BY id", openID)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +226,7 @@ func (s *Store) ListTodos(openID string) ([]Todo, error) {
 	var out []Todo
 	for rows.Next() {
 		var t Todo
-		if err := rows.Scan(&t.ID, &t.OpenID, &t.Title, &t.Status, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.OpenID, &t.Title, &t.Status, &t.CreatedAt, &t.FeishuTaskID); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
