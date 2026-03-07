@@ -195,7 +195,6 @@ config key 仅限：feishu_app_id, feishu_app_secret, llm_api_key, llm_base_url,
 	body := map[string]interface{}{
 		"model":           model,
 		"messages":        messages,
-		"max_tokens":      1024,
 		"response_format": map[string]string{"type": "json_object"},
 	}
 	bodyBytes, _ := json.Marshal(body)
@@ -223,9 +222,8 @@ config key 仅限：feishu_app_id, feishu_app_secret, llm_api_key, llm_base_url,
 			// 部分提供商不支持 response_format，降级重试（去掉 response_format）
 			if resp.StatusCode == 400 || resp.StatusCode == 422 {
 				bodyFallback := map[string]interface{}{
-					"model":      model,
-					"messages":   messages,
-					"max_tokens": 1024,
+					"model":    model,
+					"messages": messages,
 				}
 				bodyBytes, _ = json.Marshal(bodyFallback)
 				continue
@@ -264,10 +262,13 @@ config key 仅限：feishu_app_id, feishu_app_secret, llm_api_key, llm_base_url,
 			time.Sleep(400 * time.Millisecond)
 		}
 	}
-	// 全部重试失败：将原始内容作为 reply 降级返回，而非报错
-	out.Reply = lastRaw
+	// 全部重试失败：尝试从不完整 JSON 中提取 reply 字段，否则返回原始内容
+	out.Reply = extractReplyField(lastRaw)
 	if out.Reply == "" {
-		out.Reply = "已处理，但无法解析结构化结果。"
+		out.Reply = lastRaw
+	}
+	if out.Reply == "" {
+		out.Reply = "抱歉，我没能理解你的意思，请换一种方式表达。"
 	}
 	return out, nil
 }
@@ -410,6 +411,46 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string([]rune(s)[:max]) + "…"
+}
+
+// extractReplyField 从可能不完整的 JSON 文本中提取 "reply" 字段值（容错）
+func extractReplyField(s string) string {
+	// 尝试找 "reply":"..." 模式，支持转义字符和截断
+	key := `"reply":"`
+	idx := strings.Index(s, key)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(key)
+	var buf []rune
+	runes := []rune(s)
+	escape := false
+	for i := start; i < len(runes); i++ {
+		ch := runes[i]
+		if escape {
+			switch ch {
+			case 'n':
+				buf = append(buf, '\n')
+			case 't':
+				buf = append(buf, '\t')
+			case '"', '\\', '/':
+				buf = append(buf, ch)
+			default:
+				buf = append(buf, '\\', ch)
+			}
+			escape = false
+			continue
+		}
+		if ch == '\\' {
+			escape = true
+			continue
+		}
+		if ch == '"' {
+			break
+		}
+		buf = append(buf, ch)
+	}
+	return strings.TrimSpace(string(buf))
 }
 
 // extractJSON 从字符串中提取第一个完整的 JSON 对象（用括号计数，避免截断/截错）
