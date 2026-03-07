@@ -20,13 +20,17 @@ func StartWSClient(appID, appSecret string, onMessage ProcessMessageFunc) {
 	eventHandler := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
 			openID, messageID, content := extractP2Message(event)
+			log.Printf("[feishu] 收到消息 event: open_id=%q message_id=%q content_len=%d", openID, messageID, len(content))
 			if messageID == "" {
+				log.Printf("[feishu] 跳过: message_id 为空")
 				return nil
 			}
 			text := ParseTextContent(content)
 			if text == "" {
+				log.Printf("[feishu] 跳过: 解析文本为空 (content=%q)", content)
 				return nil
 			}
+			log.Printf("[feishu] 处理文本: %q", text)
 			reply, sendReply := onMessage(openID, messageID, text)
 			if sendReply && reply != "" {
 				if err := ReplyMessage(messageID, reply); err != nil {
@@ -37,9 +41,9 @@ func StartWSClient(appID, appSecret string, onMessage ProcessMessageFunc) {
 		})
 	cli := ws.NewClient(appID, appSecret,
 		ws.WithEventHandler(eventHandler),
-		ws.WithLogLevel(larkcore.LogLevelError),
+		ws.WithLogLevel(larkcore.LogLevelInfo), // 可改为 LogLevelError 减少日志
 	)
-	log.Printf("WILL: 飞书长连接启动中…")
+	log.Printf("WILL: 飞书长连接启动中…（请在开放平台「事件订阅」里添加「接收消息」事件并保存）")
 	if err := cli.Start(context.Background()); err != nil {
 		log.Printf("WILL: 飞书长连接异常退出: %v", err)
 	}
