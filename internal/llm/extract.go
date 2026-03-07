@@ -33,6 +33,44 @@ type Response struct {
 	Reply   string            `json:"reply"`
 }
 
+// TestConfig 校验 LLM 配置是否可用（发一次最小 completion 请求）
+func TestConfig(cfg *config.Config) error {
+	if cfg == nil || cfg.LLMApiKey == "" {
+		return fmt.Errorf("未配置 LLM API Key")
+	}
+	baseURL := strings.TrimRight(cfg.LLMBaseURL, "/")
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+	model := cfg.LLMModel
+	if model == "" {
+		model = "gpt-4o-mini"
+	}
+	body := map[string]interface{}{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+		"max_tokens": 1,
+	}
+	bodyBytes, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("LLM 连接失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("LLM 请求失败: %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // Call 调用 LLM，解析出 config/memory/command/reply
 func Call(cfg *config.Config, userScope string, userMessage string) (Response, error) {
 	var out Response

@@ -35,13 +35,13 @@ func main() {
 			s = st
 			defer s.Close()
 			cfg = config.LoadFromStore(s)
-			// SQLite 中无 LLM 配置且无环境变量时，在命令行与用户交互并写入
-			if next := setup.PromptLLMIfMissing(s); next != nil {
+			// 启动时检测 LLM、飞书：缺失或校验失败则交互填写，直到通过（飞书可回车跳过）
+			if next := setup.RunStartup(s); next != nil {
 				cfg = next
 			}
 		}
 		if cfg.LLMApiKey == "" {
-			log.Fatal("请先配置 LLM：运行程序时在命令行按提示输入，或设置环境变量 OPENAI_API_KEY、OPENAI_BASE_URL、OPENAI_MODEL，或访问 http://本机:PORT/setup 写入后重启。")
+			log.Fatal("请先配置 LLM：运行程序时按命令行提示输入，或设置环境变量 OPENAI_*，或访问 http://本机:PORT/setup 后重启。")
 		}
 	}
 
@@ -106,8 +106,9 @@ func handleSetup(s *store.Store) http.HandlerFunc {
 		}
 
 		if r.Method == http.MethodGet {
+			cfg := config.LoadFromStore(s)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(setupHTML))
+			w.Write([]byte(buildSetupHTML(cfg)))
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -131,7 +132,7 @@ func handleSetup(s *store.Store) http.HandlerFunc {
 		set(store.ConfigKeyFeishuAppID, r.Form.Get("feishu_app_id"))
 		set(store.ConfigKeyFeishuAppSecret, r.Form.Get("feishu_app_secret"))
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte("已保存。请将飞书事件订阅请求 URL 指向本服务的 /feishu，然后可在飞书中与 WILL 对话。"))
+		w.Write([]byte("已保存。若刚配置飞书，请重启 WILL 使长连接生效；默认使用长连接，无需公网 URL。"))
 	}
 }
 
@@ -143,18 +144,34 @@ func isLocal(r *http.Request) bool {
 	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
-const setupHTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>WILL 配置</title></head><body>
-<h1>WILL 首次配置</h1>
-<p>请先填写 LLM（必填），飞书可选。保存后可在飞书对话中通过自然语言继续修改配置。</p>
+func buildSetupHTML(cfg *config.Config) string {
+	esc := func(s string) string {
+		return strings.NewReplacer("&", "&amp;", "\"", "&quot;", "<", "&lt;", ">", "&gt;").Replace(s)
+	}
+	apiKey := esc(cfg.LLMApiKey)
+	baseURL := esc(cfg.LLMBaseURL)
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+	model := esc(cfg.LLMModel)
+	if model == "" {
+		model = "gpt-4o-mini"
+	}
+	feishuID := esc(cfg.FeishuAppID)
+	feishuSecret := esc(cfg.FeishuAppSecret)
+	return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>WILL 配置</title></head><body>
+<h1>WILL 配置</h1>
+<p>LLM 必填，飞书可选。保存后若修改了飞书凭证请重启 WILL 使长连接生效。</p>
 <form method="post">
-  <p><label>LLM API Key <input name="llm_api_key" size="60" placeholder="sk-..."></label></p>
-  <p><label>LLM Base URL <input name="llm_base_url" size="60" value="https://api.openai.com/v1"></label></p>
-  <p><label>LLM Model <input name="llm_model" size="30" value="gpt-4o-mini"></label></p>
-  <p><label>飞书 App ID <input name="feishu_app_id" size="40"></label></p>
-  <p><label>飞书 App Secret <input name="feishu_app_secret" size="50"></label></p>
+  <p><label>LLM API Key <input name="llm_api_key" size="60" placeholder="sk-..." value="` + apiKey + `"></label></p>
+  <p><label>LLM Base URL <input name="llm_base_url" size="60" value="` + baseURL + `"></label></p>
+  <p><label>LLM Model <input name="llm_model" size="30" value="` + model + `"></label></p>
+  <p><label>飞书 App ID <input name="feishu_app_id" size="40" value="` + feishuID + `"></label></p>
+  <p><label>飞书 App Secret <input name="feishu_app_secret" size="50" value="` + feishuSecret + `"></label></p>
   <p><button type="submit">保存</button></p>
 </form>
 </body></html>`
+}
 
 func handleFeishu(s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -13,6 +14,21 @@ var (
 	globalClient *lark.Client
 	clientMu     sync.RWMutex
 )
+
+// TestCredentials 校验飞书 App ID / Secret 是否可用（拉取 tenant token）
+func TestCredentials(appID, appSecret string) error {
+	if appID == "" || appSecret == "" {
+		return fmt.Errorf("app_id 或 app_secret 为空")
+	}
+	cli := lark.NewClient(appID, appSecret)
+	ctx := context.Background()
+	req := &larkcore.SelfBuiltTenantAccessTokenReq{
+		AppId:     appID,
+		AppSecret: appSecret,
+	}
+	_, err := cli.GetTenantAccessTokenBySelfBuiltApp(ctx, req)
+	return err
+}
 
 // InitClient 使用 appID、appSecret 初始化全局飞书 SDK 客户端，回复与发消息均通过该客户端
 func InitClient(appID, appSecret string) {
