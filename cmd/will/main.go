@@ -63,6 +63,18 @@ func main() {
 		mux.HandleFunc("/setup", handleSetup(s))
 		if cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
 			feishu.InitClient(cfg.FeishuAppID, cfg.FeishuAppSecret)
+			if s != nil {
+				openID, _ := s.GetConfig(store.ConfigKeyPostUpdateNotifyOpenID)
+				if openID != "" {
+					s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, "")
+					notes := updater.ReleaseNotes(Version)
+					msg := "WILL 已更新到 v" + Version + "。"
+					if notes != "" {
+						msg += "\n\n本版更新说明：\n" + notes
+					}
+					_ = feishu.SendMessageToUser(openID, msg)
+				}
+			}
 			if cfg.FeishuSubscribeMode == "ws" {
 				go feishu.StartWSClient(cfg.FeishuAppID, cfg.FeishuAppSecret, func(openID, messageID, text string) (string, bool) {
 					return processFeishuMessage(s, openID, messageID, text)
@@ -297,7 +309,9 @@ func tryHandleUpdateReply(s *store.Store, cfg *config.Config, openID, text, mess
 			_ = feishu.ReplyMessage(messageID, "获取更新失败 — "+err.Error())
 			return true
 		}
+		s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, notifyID)
 		if err := updater.DownloadAndApply(assetURL); err != nil {
+			s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, "")
 			_ = feishu.ReplyMessage(messageID, "更新失败 — "+err.Error())
 			return true
 		}

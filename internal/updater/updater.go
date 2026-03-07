@@ -16,10 +16,12 @@ import (
 
 const repo = "lizhemin15/WILL"
 const apiLatest = "https://api.github.com/repos/" + repo + "/releases/latest"
+const apiTagFmt = "https://api.github.com/repos/" + repo + "/releases/tags/v%s"
 
 // Release 来自 GitHub API
 type Release struct {
 	TagName string  `json:"tag_name"`
+	Body    string  `json:"body"`
 	Assets  []Asset `json:"assets"`
 }
 
@@ -173,6 +175,30 @@ func VersionCheckReply(currentVersion string) (reply string) {
 		return "当前 v" + currentVersion + "，已是最新。"
 	}
 	return "当前 v" + currentVersion + "，发现新版本 v" + latestVer + "。回复「立即更新」可更新。"
+}
+
+// ReleaseNotes 拉取指定版本的 release 说明（body），失败返回空字符串
+func ReleaseNotes(version string) string {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if version == "" {
+		return ""
+	}
+	url := fmt.Sprintf(apiTagFmt, version)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var rel Release
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(rel.Body)
 }
 
 // CompareVersion 比较 a 与 b，若 a > b 返回 true
