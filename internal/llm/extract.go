@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/yourusername/will/internal/config"
@@ -138,55 +139,68 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 	messages = append(messages, map[string]string{"role": "user", "content": userMessage})
 
 	body := map[string]interface{}{
-		"model":    model,
-		"messages": messages,
+		"model":      model,
+		"messages":   messages,
 		"max_tokens": 1024,
 	}
 	bodyBytes, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return out, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return out, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		msg := string(body)
-		if len(msg) > 300 {
-			msg = msg[:300] + "..."
+	const maxParseRetries = 3
+	var lastParseErr error
+	for attempt := 0; attempt < maxParseRetries; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return out, err
 		}
-		if msg != "" {
-			return out, fmt.Errorf("LLM 请求失败: %d — %s", resp.StatusCode, strings.TrimSpace(msg))
-		}
-		return out, fmt.Errorf("LLM 请求失败: %d", resp.StatusCode)
-	}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
 
-	var apiResp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return out, err
+		}
+		raw, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return out, readErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			msg := string(raw)
+			if len(msg) > 300 {
+				msg = msg[:300] + "..."
+			}
+			if msg != "" {
+				return out, fmt.Errorf("LLM 请求失败: %d — %s", resp.StatusCode, strings.TrimSpace(msg))
+			}
+			return out, fmt.Errorf("LLM 请求失败: %d", resp.StatusCode)
+		}
+
+		var apiResp struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(raw, &apiResp); err != nil {
+			return out, err
+		}
+		if len(apiResp.Choices) == 0 {
+			return out, fmt.Errorf("LLM 未返回内容")
+		}
+		content := strings.TrimSpace(apiResp.Choices[0].Message.Content)
+		content = extractJSON(content)
+		if err := json.Unmarshal([]byte(content), &out); err != nil {
+			lastParseErr = err
+			if attempt < maxParseRetries-1 {
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			return out, fmt.Errorf("解析 LLM 返回的 JSON 失败: %w", lastParseErr)
+		}
+		return out, nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return out, err
-	}
-	if len(apiResp.Choices) == 0 {
-		return out, fmt.Errorf("LLM 未返回内容")
-	}
-	content := strings.TrimSpace(apiResp.Choices[0].Message.Content)
-	content = extractJSON(content)
-	if err := json.Unmarshal([]byte(content), &out); err != nil {
-		return out, fmt.Errorf("解析 LLM 返回的 JSON 失败: %w", err)
-	}
-	return out, nil
+	return out, fmt.Errorf("解析 LLM 返回的 JSON 失败: %w", lastParseErr)
 }
 
 // PendingConfigKey 存在此 key 时表示有待用户确认的配置变更（值为 JSON map[storeKey]value）
