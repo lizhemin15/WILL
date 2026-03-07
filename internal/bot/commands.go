@@ -1,10 +1,13 @@
 package bot
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/yourusername/will/internal/config"
 	"github.com/yourusername/will/internal/feishu"
@@ -55,6 +58,8 @@ func HandleCommand(text string, openID string, s *store.Store, cfg *config.Confi
 			return cmdStatus(openID, s, cfg), true
 		case "reset", "new":
 			return cmdReset(openID, s), true
+		case "pair":
+			return cmdPair(openID, s, cfg), true
 		}
 		return "用法: /help", true
 	}
@@ -91,6 +96,7 @@ func cmdHelp() string {
 /config get        — 查看当前配置（密钥脱敏）
 /config <key> <v>  — 修改配置（llm_api_key、llm_base_url、llm_model 等）
 /allow me          — 将当前用户加入授权列表
+/pair              — 生成从节点配对码（10分钟有效，用于绑定新机器人）
 
 自然语言也可：直接说「添加待办 xxx」「每天9点提醒我」「现在几点」等，AI 会直接处理。`
 }
@@ -373,6 +379,29 @@ func cmdReset(openID string, s *store.Store) string {
 		return "清空失败: " + err.Error()
 	}
 	return "对话历史已清空，开始新对话。"
+}
+
+// cmdPair 生成一次性配对码，供新从节点在部署时使用
+func cmdPair(openID string, s *store.Store, cfg *config.Config) string {
+	if s == nil {
+		return "未启用本地存储，无法生成配对码。"
+	}
+	if cfg != nil && cfg.Mode == config.ModeWorker {
+		return "从节点模式下不支持生成配对码，请在主节点上执行此命令。"
+	}
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return "生成配对码失败: " + err.Error()
+	}
+	token := "WILL-" + strings.ToUpper(hex.EncodeToString(b))
+	expiry := time.Now().Add(10 * time.Minute).Unix()
+	if err := s.SavePairToken(token, expiry); err != nil {
+		return "保存配对码失败: " + err.Error()
+	}
+	return fmt.Sprintf(
+		"配对码：%s\n有效期：10 分钟\n\n在新机器人节点启动时选择「机器人间通信」模式，输入本机地址和此配对码即可完成绑定。",
+		token,
+	)
 }
 
 func formatTodoIndices(indices []int) string {

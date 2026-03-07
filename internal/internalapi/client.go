@@ -10,6 +10,35 @@ import (
 	"time"
 )
 
+// PairWithMain 向主节点发起配对请求，不使用 Bearer 鉴权（令牌在请求体中）
+func PairWithMain(ctx context.Context, mainURL, token, workerURL string) (*PairResponse, error) {
+	mainURL = strings.TrimRight(mainURL, "/")
+	reqBody := PairRequest{Token: token, WorkerURL: workerURL}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, mainURL+"/internal/pair", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out PairResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return &out, fmt.Errorf("主节点返回 %d: %s", resp.StatusCode, out.Error)
+	}
+	return &out, nil
+}
+
 // Client 主节点调用 worker 的客户端
 type Client struct {
 	BaseURL string

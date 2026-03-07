@@ -31,6 +31,7 @@ type Config struct {
 
 	InternalToken string
 	WorkerURLs    []string
+	MainURL       string // 从节点记录的主节点地址
 
 	Timezone string // IANA 时区，默认 Asia/Shanghai
 }
@@ -105,6 +106,7 @@ func loadFrom(s *store.Store) *Config {
 		FeishuSubscribeMode: subscribeMode,
 		InternalToken:       get("WILL_INTERNAL_TOKEN", store.ConfigKeyInternalToken, ""),
 		WorkerURLs:          workerURLs,
+		MainURL:             get("WILL_MAIN_URL", store.ConfigKeyMainURL, ""),
 		Timezone:            get("WILL_TIMEZONE", store.ConfigKeyTimezone, "Asia/Shanghai"),
 	}
 }

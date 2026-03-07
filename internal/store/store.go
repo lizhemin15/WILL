@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ const (
 	ConfigKeyPostUpdateNotifyOpenID = "post_update_notify_open_id"
 	ConfigKeyFeishuSubscribeMode    = "feishu_subscribe_mode"
 	ConfigKeyTimezone               = "timezone"
+	ConfigKeyMainURL                = "main_url"
 
 	KindUserScheduled   = "user_scheduled"
 	KindDoVersionCheck  = "do_version_check"
@@ -371,6 +373,28 @@ func (s *Store) ConversationCount(openID string) int {
 	var n int
 	_ = s.db.QueryRow("SELECT COUNT(*) FROM conversation WHERE open_id=?", openID).Scan(&n)
 	return n
+}
+
+// ── Pair Tokens ───────────────────────────────────────────────────────────────
+
+// SavePairToken 保存一个短期有效的配对令牌（scope=system:pair，key=token，value=expiry unix）
+func (s *Store) SavePairToken(token string, expiresAt int64) error {
+	return s.SetMemory("system:pair", token, strconv.FormatInt(expiresAt, 10))
+}
+
+// ConsumePairToken 校验令牌是否有效：有效则删除并返回 true，无效/过期返回 false
+func (s *Store) ConsumePairToken(token string) bool {
+	val, ok := s.GetMemory("system:pair", token)
+	if !ok || val == "" {
+		return false
+	}
+	expiry, err := strconv.ParseInt(val, 10, 64)
+	if err != nil || time.Now().Unix() > expiry {
+		_ = s.DeleteMemory("system:pair", token)
+		return false
+	}
+	_ = s.DeleteMemory("system:pair", token)
+	return true
 }
 
 func (s *Store) GetRecentConversation(openID string, maxMessages int) ([]ConvMessage, error) {

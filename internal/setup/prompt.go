@@ -2,25 +2,111 @@ package setup
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/yourusername/will/internal/config"
 	"github.com/yourusername/will/internal/feishu"
+	"github.com/yourusername/will/internal/internalapi"
 	"github.com/yourusername/will/internal/llm"
 	"github.com/yourusername/will/internal/store"
 )
 
 const urlHint = "只填到域名或 /v1，不要加 /chat/completions 等路径。例如: https://api.openai.com/v1"
 
-// RunStartup 启动时检测 LLM、飞书配置，缺失或校验失败则交互填写，直到通过或用户跳过（飞书可跳过）
+// RunStartup 启动时检测配置：LLM 必须配置；首次部署时询问通信方式（飞书 或 机器人间通信）。
 func RunStartup(s *store.Store) *config.Config {
 	if s == nil {
 		return nil
 	}
 	_ = ensureLLM(s)
+
+	cfg := config.LoadFromStore(s)
+
+	// 已配置为从节点模式，跳过后续询问
+	if cfg.Mode == config.ModeWorker {
+		fmt.Fprintln(os.Stdout, "[WILL] 从节点模式，跳过飞书配置。")
+		return cfg
+	}
+
+	// 飞书已配置（重启场景），只做校验无需重新选择模式
+	if cfg.FeishuAppID != "" || cfg.FeishuAppSecret != "" {
+		ensureFeishuOrSkip(s)
+		return config.LoadFromStore(s)
+	}
+
+	// 首次部署：询问通信方式
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "选择通信方式：")
+	fmt.Fprintln(os.Stdout, "  [1] 飞书通信（直接与飞书机器人对话，主节点 / 独立节点）")
+	fmt.Fprintln(os.Stdout, "  [2] 机器人间通信（作为从节点绑定到已有的飞书机器人上）")
+	fmt.Fprint(os.Stdout, "请选择 [1/2]（默认 1）: ")
+	choice, _ := reader.ReadString('\n')
+	choice = strings.TrimSpace(choice)
+
+	if choice == "2" {
+		return ensurePeerPairing(s, reader)
+	}
+
 	ensureFeishuOrSkip(s)
+	return config.LoadFromStore(s)
+}
+
+// ensurePeerPairing 引导用户完成与主节点的配对，写入 worker 模式所需配置
+func ensurePeerPairing(s *store.Store, reader *bufio.Reader) *config.Config {
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "机器人间配对步骤：")
+	fmt.Fprintln(os.Stdout, "  1. 在主节点机器人的飞书对话中发送 /pair")
+	fmt.Fprintln(os.Stdout, "  2. 将显示的配对码填入下方")
+	fmt.Fprintln(os.Stdout, "")
+
+	var mainURL string
+	for {
+		fmt.Fprint(os.Stdout, "主节点地址（如 http://192.168.1.5:3000）: ")
+		line, _ := reader.ReadString('\n')
+		mainURL = strings.TrimSpace(line)
+		if mainURL != "" {
+			break
+		}
+		fmt.Fprintln(os.Stdout, "地址不能为空。")
+	}
+
+	var pairToken string
+	for {
+		fmt.Fprint(os.Stdout, "配对码（如 WILL-XXXXXXXX）: ")
+		line, _ := reader.ReadString('\n')
+		pairToken = strings.TrimSpace(line)
+		if pairToken != "" {
+			break
+		}
+		fmt.Fprintln(os.Stdout, "配对码不能为空。")
+	}
+
+	fmt.Fprintln(os.Stdout, "正在连接主节点配对…")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 从节点通过 WebSocket 连接主节点，无需暴露端口，selfURL 传空即可
+	resp, err := internalapi.PairWithMain(ctx, mainURL, pairToken, "")
+	if err != nil {
+		fmt.Fprintln(os.Stdout, "配对失败:", err)
+		fmt.Fprintln(os.Stdout, "请检查主节点地址和配对码后重新运行。")
+		os.Exit(1)
+	}
+	if !resp.OK {
+		fmt.Fprintln(os.Stdout, "配对失败:", resp.Error)
+		os.Exit(1)
+	}
+
+	_ = s.SetConfig(store.ConfigKeyMode, string(config.ModeWorker))
+	_ = s.SetConfig(store.ConfigKeyInternalToken, resp.WorkerToken)
+	_ = s.SetConfig(store.ConfigKeyMainURL, mainURL)
+
+	fmt.Fprintln(os.Stdout, "配对成功！已设为从节点模式，启动后将自动连接主节点。")
 	return config.LoadFromStore(s)
 }
 

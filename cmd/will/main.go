@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,10 +18,14 @@ import (
 	"github.com/yourusername/will/internal/internalapi"
 	"github.com/yourusername/will/internal/llm"
 	"github.com/yourusername/will/internal/orchestrator"
+	"github.com/yourusername/will/internal/peer"
 	"github.com/yourusername/will/internal/setup"
 	"github.com/yourusername/will/internal/store"
 	"github.com/yourusername/will/internal/updater"
 )
+
+// globalHub 主节点模式下持有 WebSocket hub（worker 模式为 nil）
+var globalHub *peer.Hub
 
 // ── 消息去重（OpenClaw 风格：防止飞书重推导致重复处理）────────────────────────
 var (
@@ -65,6 +68,20 @@ func main() {
 	cfg := setup.RunStartup(s)
 	if cfg == nil {
 		cfg = config.LoadFromStore(s)
+	}
+
+	// 按模式启动对应服务
+	switch cfg.Mode {
+	case config.ModeWorker:
+		// 从节点：通过 WebSocket 连接主节点，无需暴露端口
+		wc := &peer.WorkerClient{MainURL: cfg.MainURL, Token: cfg.InternalToken}
+		go wc.Start(context.Background())
+		log.Printf("[worker] 从节点已启动，连接主节点 %s", cfg.MainURL)
+		select {}
+	case config.ModeMain:
+		// 主节点：创建 hub，启动 HTTP 服务（pair + WebSocket）
+		globalHub = peer.NewHub(s)
+		go startMainHTTP(s, cfg)
 	}
 
 	// 尽早初始化飞书客户端，确保更新后通知能正常发出
@@ -396,7 +413,7 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 	case "shell_exec":
 		var p struct{ Command string `json:"command"` }
 		_ = json.Unmarshal(argsJSON, &p)
-		return runTask(cfg, strings.TrimSpace(p.Command))
+		return runTask(s, cfg, strings.TrimSpace(p.Command))
 
 	default:
 		return fmt.Sprintf("未知工具: %s", name)
@@ -645,7 +662,7 @@ func formatIndices(indices []int) string {
 	return strings.Join(parts, "、")
 }
 
-func runTask(cfg *config.Config, instruction string) string {
+func runTask(s *store.Store, cfg *config.Config, instruction string) string {
 	if instruction == "" {
 		return "收到空指令。"
 	}
@@ -656,19 +673,15 @@ func runTask(cfg *config.Config, instruction string) string {
 	if strings.ToLower(firstWord) == "git" {
 		return "检查版本请说「检查新版本」，无需 git。"
 	}
-	if cfg.Mode == config.ModeMain && len(cfg.WorkerURLs) > 0 && cfg.InternalToken != "" {
-		workerURL := strings.TrimRight(cfg.WorkerURLs[0], "/")
-		client := internalapi.NewClient(workerURL, cfg.InternalToken)
+	// 主节点且有在线从节点时，通过 WebSocket 派发给从节点执行
+	if cfg.Mode == config.ModeMain && globalHub != nil && globalHub.WorkerCount() > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		resp, err := client.Exec(ctx, instruction, "", 300)
+		res, err := globalHub.Exec(ctx, instruction, "", 300)
 		if err != nil {
-			return "worker 调用失败 — " + err.Error()
+			return "从节点调用失败 — " + err.Error()
 		}
-		if resp.Error != "" {
-			return resp.Stdout + "\nstderr: " + resp.Stderr + "\nerror: " + resp.Error
-		}
-		return resp.Stdout
+		return peer.FormatResult(res)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -750,24 +763,17 @@ func buildConvText(s *store.Store, openID string, n int) string {
 	return b.String()
 }
 
-// ── HTTP worker handler (worker 模式) ─────────────────────────────────────────
+// ── HTTP 服务（main 模式） ─────────────────────────────────────────────────────
 
-func startWorkerHTTP(s *store.Store, cfg *config.Config) {
+func startMainHTTP(s *store.Store, cfg *config.Config) {
 	mux := http.NewServeMux()
-	handler := internalapi.AuthMiddleware(cfg.InternalToken, internalapi.HandleExec)
-	mux.HandleFunc("/internal/exec", handler)
-	addr := cfg.Bind + ":" + cfg.Port
-	log.Printf("[worker] 监听 %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("[worker] HTTP 服务失败: %v", err)
+	mux.HandleFunc("/internal/pair", internalapi.HandlePair(s))
+	if globalHub != nil {
+		mux.HandleFunc("/internal/ws", globalHub.HubHandler())
 	}
-}
-
-func init() {
-	// worker 模式下从环境变量判断
-	if os.Getenv("WILL_MODE") == "worker" {
-		cfg := config.Load()
-		s, _ := store.Open("")
-		go startWorkerHTTP(s, cfg)
+	addr := cfg.Bind + ":" + cfg.Port
+	log.Printf("[main] HTTP 服务监听 %s（pair + WebSocket）", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("[main] HTTP 服务失败: %v", err)
 	}
 }

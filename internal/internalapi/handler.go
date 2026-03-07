@@ -1,12 +1,15 @@
 package internalapi
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/yourusername/will/internal/exec"
+	"github.com/yourusername/will/internal/store"
 )
 
 const DefaultExecTimeout = 5 * time.Minute
@@ -85,4 +88,67 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// ── Pair API ──────────────────────────────────────────────────────────────────
+
+// PairRequest 从节点发起配对请求
+type PairRequest struct {
+	Token     string `json:"token"`
+	WorkerURL string `json:"worker_url"` // 从节点对外可访问地址，主节点用于回调
+}
+
+// PairResponse 主节点返回配对结果
+type PairResponse struct {
+	OK          bool   `json:"ok"`
+	WorkerToken string `json:"worker_token,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// HandlePair 处理 POST /internal/pair：校验配对码，注册从节点 URL，返回 internal token
+func HandlePair(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, PairResponse{OK: false, Error: "method not allowed"})
+			return
+		}
+		var req PairRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, PairResponse{OK: false, Error: "invalid json"})
+			return
+		}
+		if req.Token == "" {
+			writeJSON(w, http.StatusBadRequest, PairResponse{OK: false, Error: "token required"})
+			return
+		}
+		if !s.ConsumePairToken(req.Token) {
+			writeJSON(w, http.StatusUnauthorized, PairResponse{OK: false, Error: "配对码无效或已过期"})
+			return
+		}
+
+		// 获取或生成 internal token
+		internalToken, ok := s.GetConfig(store.ConfigKeyInternalToken)
+		if !ok || internalToken == "" {
+			b := make([]byte, 16)
+			_, _ = rand.Read(b)
+			internalToken = hex.EncodeToString(b)
+			_ = s.SetConfig(store.ConfigKeyInternalToken, internalToken)
+		}
+
+		// 注册从节点 URL
+		if req.WorkerURL != "" {
+			existing, _ := s.GetConfig(store.ConfigKeyWorkerURLs)
+			var urls []string
+			for _, u := range strings.Split(existing, ",") {
+				u = strings.TrimSpace(u)
+				if u != "" && u != req.WorkerURL {
+					urls = append(urls, u)
+				}
+			}
+			urls = append(urls, req.WorkerURL)
+			_ = s.SetConfig(store.ConfigKeyWorkerURLs, strings.Join(urls, ","))
+		}
+
+		writeJSON(w, http.StatusOK, PairResponse{OK: true, WorkerToken: internalToken})
+	}
 }
