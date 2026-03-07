@@ -19,7 +19,7 @@ func RunStartup(s *store.Store) *config.Config {
 	if s == nil {
 		return nil
 	}
-	cfg := ensureLLM(s)
+	_ = ensureLLM(s)
 	ensureFeishuOrSkip(s)
 	return config.LoadFromStore(s)
 }
