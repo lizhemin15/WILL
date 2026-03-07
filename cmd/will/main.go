@@ -253,15 +253,43 @@ func processFeishuMessage(s *store.Store, openID, messageID, text string) (reply
 		_, _ = s.AddScheduledTask("do_version_check", "", time.Now().Add(2*time.Minute).Unix())
 	}
 	if len(cfg.FeishuAllowed) > 0 && !feishu.IsAllowed(openID, cfg.FeishuAllowed) {
-		return "WILL：未授权用户，忽略。", true
+		return "未授权用户，忽略。", true
 	}
 	if s != nil && tryHandleUpdateReply(s, cfg, openID, text, messageID) {
 		return "", false // 已在 tryHandleUpdateReply 内回复
 	}
 	if rpl, ok := bot.HandleCommand(text, openID, s, cfg); ok {
-		return "WILL：\n" + rpl, true
+		return rpl, true
+	}
+	// 用户说「检查新版本」等时走 GitHub 版本号检查，不执行 LLM 解析出的 git 命令
+	if isVersionCheckRequest(text) {
+		reply := updater.VersionCheckReply(Version)
+		if s != nil && strings.Contains(reply, "发现新版本") {
+			latestVer, _, _ := updater.CheckLatest()
+			if latestVer != "" {
+				s.SetConfig(store.ConfigKeyLatestVersion, latestVer)
+				s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
+				s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, openID)
+			}
+		}
+		return reply, true
 	}
 	return runWithLLM(s, cfg, openID, text), true
+}
+
+func isVersionCheckRequest(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	t = strings.ToLower(t)
+	keywords := []string{"检查新版本", "检查更新", "有没有新版本", "查版本", "检查版本", "更新检查", "/version"}
+	for _, k := range keywords {
+		if t == k || strings.Contains(t, k) {
+			return true
+		}
+	}
+	return false
 }
 
 const updatePromptMaxAge = 24 * time.Hour
@@ -293,14 +321,14 @@ func tryHandleUpdateReply(s *store.Store, cfg *config.Config, openID, text, mess
 	case "now":
 		_, assetURL, err = updater.CheckLatest()
 		if err != nil {
-			_ = feishu.ReplyMessage(messageID, "WILL：获取更新失败 — "+err.Error())
+			_ = feishu.ReplyMessage(messageID, "获取更新失败 — "+err.Error())
 			return true
 		}
 		if err := updater.DownloadAndApply(assetURL); err != nil {
-			_ = feishu.ReplyMessage(messageID, "WILL：更新失败 — "+err.Error())
+			_ = feishu.ReplyMessage(messageID, "更新失败 — "+err.Error())
 			return true
 		}
-		_ = feishu.ReplyMessage(messageID, "WILL：正在更新并重启…")
+		_ = feishu.ReplyMessage(messageID, "正在更新并重启…")
 		return true
 	case "later":
 		hours := intent.RemindHours
@@ -310,10 +338,10 @@ func tryHandleUpdateReply(s *store.Store, cfg *config.Config, openID, text, mess
 		payload := `{"version":"` + latestVer + `","open_id":"` + openID + `"}`
 		runAt := time.Now().Add(time.Duration(hours) * time.Hour).Unix()
 		_, _ = s.AddScheduledTask("remind_update", payload, runAt)
-		_ = feishu.ReplyMessage(messageID, "WILL：已记录，"+strconv.Itoa(hours)+" 小时后再提醒你。")
+		_ = feishu.ReplyMessage(messageID, "已记录，"+strconv.Itoa(hours)+" 小时后再提醒你。")
 		return true
 	default:
-		_ = feishu.ReplyMessage(messageID, "WILL：本次不更新，之后有新版本会再提醒。")
+		_ = feishu.ReplyMessage(messageID, "本次不更新，之后有新版本会再提醒。")
 		return true
 	}
 }
@@ -396,26 +424,26 @@ func runScheduledTasks(s *store.Store) {
 func runWithLLM(s *store.Store, cfg *config.Config, openID string, userMessage string) string {
 	resp, err := llm.Call(cfg, "user:"+openID, userMessage)
 	if err != nil {
-		return "WILL：LLM 调用失败 — " + err.Error()
+		return "LLM 调用失败 — " + err.Error()
 	}
 	command, replyText := llm.Apply(s, openID, resp)
 	if command != "" {
 		out := runTask(cfg, command)
 		if replyText != "" {
-			return "WILL：\n" + replyText + "\n\n" + out
+			return replyText + "\n\n" + out
 		}
 		return out
 	}
 	if replyText != "" {
-		return "WILL：\n" + replyText
+		return replyText
 	}
-	return "WILL：已处理。"
+	return "已处理。"
 }
 
 func runTask(cfg *config.Config, instruction string) string {
 	instruction = strings.TrimSpace(instruction)
 	if instruction == "" {
-		return "WILL：收到空指令。"
+		return "收到空指令。"
 	}
 
 	if cfg.Mode == config.ModeMain && len(cfg.WorkerURLs) > 0 && cfg.InternalToken != "" {
@@ -425,16 +453,16 @@ func runTask(cfg *config.Config, instruction string) string {
 		defer cancel()
 		resp, err := client.Exec(ctx, instruction, "", 300)
 		if err != nil {
-			return "WILL：worker 调用失败 — " + err.Error()
+			return "worker 调用失败 — " + err.Error()
 		}
 		if resp.Error != "" {
-			return "WILL：\n" + resp.Stdout + "\nstderr: " + resp.Stderr + "\nerror: " + resp.Error
+			return resp.Stdout + "\nstderr: " + resp.Stderr + "\nerror: " + resp.Error
 		}
-		return "WILL：\n" + resp.Stdout
+		return resp.Stdout
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	res := exec.Run(ctx, instruction, "", 5*time.Minute)
-	return "WILL：\n" + res.String()
+	return res.String()
 }

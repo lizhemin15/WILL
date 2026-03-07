@@ -162,6 +162,19 @@ func DownloadAndApply(assetURL string) error {
 	return nil
 }
 
+// VersionCheckReply 根据 GitHub 发布检查版本，返回给用户看的文案（不执行 git）
+func VersionCheckReply(currentVersion string) (reply string) {
+	currentVersion = strings.TrimPrefix(currentVersion, "v")
+	latestVer, _, err := CheckLatest()
+	if err != nil {
+		return "检查更新失败: " + err.Error()
+	}
+	if !CompareVersion(latestVer, currentVersion) {
+		return "当前 v" + currentVersion + "，已是最新。"
+	}
+	return "当前 v" + currentVersion + "，发现新版本 v" + latestVer + "。回复「立即更新」可更新。"
+}
+
 // CompareVersion 比较 a 与 b，若 a > b 返回 true
 func CompareVersion(a, b string) bool {
 	a = strings.TrimPrefix(a, "v")
