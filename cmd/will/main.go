@@ -337,9 +337,8 @@ func tryHandleUpdateReply(s *store.Store, cfg *config.Config, openID, text, mess
 		return false
 	}
 	intent, err := llm.ParseUpdateReply(cfg, text)
-	if err != nil {
-		log.Printf("parse update reply: %v", err)
-		return false
+	if err != nil || intent.Action == "" {
+		return false // 消息与更新无关，继续正常处理
 	}
 	s.SetConfig(store.ConfigKeyUpdatePromptAt, "")
 	s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, "")
