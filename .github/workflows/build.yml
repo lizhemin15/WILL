@@ -10,6 +10,8 @@ on:
 
 jobs:
   build:
+    env:
+      VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +48,7 @@ jobs:
         run: |
           BIN=will
           [ "${{ matrix.goos }}" = "windows" ] && BIN=will.exe
-          go build -ldflags="-s -w" -o "dist/${{ matrix.goos }}-${{ matrix.goarch }}/$BIN" ./cmd/will
+          go build -ldflags="-s -w -X main.Version=$VERSION" -o "dist/${{ matrix.goos }}-${{ matrix.goarch }}/$BIN" ./cmd/will
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

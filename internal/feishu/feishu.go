@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	authURL   = "https://open.feishu.cn/open_apis/auth/v3/tenant_access_token/internal"
-	replyFmt  = "https://open.feishu.cn/open_apis/im/v1/messages/%s/reply"
-	tokenTTL  = 7000 * time.Second
-	userAgent = "WILL/1.0"
+	authURL      = "https://open.feishu.cn/open_apis/auth/v3/tenant_access_token/internal"
+	replyFmt     = "https://open.feishu.cn/open_apis/im/v1/messages/%s/reply"
+	sendMessageURL = "https://open.feishu.cn/open_apis/im/v1/messages?receive_id_type=open_id"
+	tokenTTL     = 7000 * time.Second
+	userAgent    = "WILL/1.0"
 )
 
 type tokenHolder struct {
@@ -105,6 +106,43 @@ func ReplyMessage(appID, appSecret, messageID, text string) error {
 	}
 	if out.Code != 0 {
 		return fmt.Errorf("feishu reply: code=%d msg=%s", out.Code, out.Msg)
+	}
+	return nil
+}
+
+// SendMessageToUser 主动给用户发消息（用于更新提醒等）
+func SendMessageToUser(appID, appSecret, openID, text string) error {
+	token, err := getTenantAccessToken(appID, appSecret)
+	if err != nil {
+		return err
+	}
+	payload := map[string]string{
+		"receive_id": openID,
+		"msg_type":   "text",
+		"content":    `{"text":"` + escapeJSONString(text) + `"}`,
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, sendMessageURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("feishu send message: code=%d msg=%s", out.Code, out.Msg)
 	}
 	return nil
 }

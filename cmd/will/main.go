@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,7 +18,11 @@ import (
 	"github.com/yourusername/will/internal/llm"
 	"github.com/yourusername/will/internal/setup"
 	"github.com/yourusername/will/internal/store"
+	"github.com/yourusername/will/internal/updater"
 )
+
+// Version 由构建时注入：-ldflags "-X main.Version=v0.0.3"
+var Version = "dev"
 
 func main() {
 	var s *store.Store
@@ -63,6 +68,10 @@ func main() {
 			mux.HandleFunc("/internal/exec", internalapi.AuthMiddleware(cfg.InternalToken, internalapi.HandleExec))
 		}
 		log.Printf("WILL %s listening on %s:%s (db=%v)", cfg.Mode, cfg.Bind, cfg.Port, s != nil)
+		if s != nil {
+			go runVersionCheck(s)
+			go runScheduledTasks(s)
+		}
 	}
 
 	addr := cfg.Bind + ":" + cfg.Port
@@ -101,7 +110,7 @@ func handleSetup(s *store.Store) http.HandlerFunc {
 			http.Error(w, "invalid form", http.StatusBadRequest)
 			return
 		}
-		
+
 		set := func(key, v string) {
 			v = strings.TrimSpace(v)
 			if v != "" {
@@ -191,6 +200,8 @@ func handleFeishu(s *store.Store) http.HandlerFunc {
 		if len(cfg.FeishuAllowed) == 0 && s != nil && openID != "" {
 			_ = s.AddAllowedOpenID(openID)
 			cfg = config.LoadFromStore(s)
+			// 绑定首个授权用户后 2 分钟做首次版本检查
+			_, _ = s.AddScheduledTask("do_version_check", "", time.Now().Add(2*time.Minute).Unix())
 		}
 
 		if len(cfg.FeishuAllowed) > 0 && !feishu.IsAllowed(openID, cfg.FeishuAllowed) {
@@ -207,6 +218,9 @@ func handleFeishu(s *store.Store) http.HandlerFunc {
 
 		go func() {
 			var reply string
+			if s != nil && tryHandleUpdateReply(s, cfg, openID, text, ev.Message.MessageID) {
+				return
+			}
 			if rpl, ok := bot.HandleCommand(text, openID, s, cfg); ok {
 				reply = "WILL：\n" + rpl
 			} else {
@@ -218,6 +232,134 @@ func handleFeishu(s *store.Store) http.HandlerFunc {
 		}()
 
 		w.WriteHeader(http.StatusOK)
+	}
+}
+
+const updatePromptMaxAge = 24 * time.Hour
+
+func tryHandleUpdateReply(s *store.Store, cfg *config.Config, openID, text, messageID string) bool {
+	promptAt, _ := s.GetConfig(store.ConfigKeyUpdatePromptAt)
+	if promptAt == "" {
+		return false
+	}
+	ts, err := strconv.ParseInt(promptAt, 10, 64)
+	if err != nil || time.Since(time.Unix(ts, 0)) > updatePromptMaxAge {
+		return false
+	}
+	notifyID, _ := s.GetConfig(store.ConfigKeyUpdateNotifyOpenID)
+	if notifyID != "" && notifyID != openID {
+		return false
+	}
+	intent, err := llm.ParseUpdateReply(cfg, text)
+	if err != nil {
+		log.Printf("parse update reply: %v", err)
+		return false
+	}
+	s.SetConfig(store.ConfigKeyUpdatePromptAt, "")
+	s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, "")
+	latestVer, _ := s.GetConfig(store.ConfigKeyLatestVersion)
+	assetURL := ""
+
+	switch intent.Action {
+	case "now":
+		_, assetURL, err = updater.CheckLatest()
+		if err != nil {
+			_ = feishu.ReplyMessage(cfg.FeishuAppID, cfg.FeishuAppSecret, messageID, "WILL：获取更新失败 — "+err.Error())
+			return true
+		}
+		if err := updater.DownloadAndApply(assetURL); err != nil {
+			_ = feishu.ReplyMessage(cfg.FeishuAppID, cfg.FeishuAppSecret, messageID, "WILL：更新失败 — "+err.Error())
+			return true
+		}
+		_ = feishu.ReplyMessage(cfg.FeishuAppID, cfg.FeishuAppSecret, messageID, "WILL：正在更新并重启…")
+		return true
+	case "later":
+		hours := intent.RemindHours
+		if hours <= 0 {
+			hours = 24
+		}
+		payload := `{"version":"` + latestVer + `","open_id":"` + openID + `"}`
+		runAt := time.Now().Add(time.Duration(hours) * time.Hour).Unix()
+		_, _ = s.AddScheduledTask("remind_update", payload, runAt)
+		_ = feishu.ReplyMessage(cfg.FeishuAppID, cfg.FeishuAppSecret, messageID, "WILL：已记录，"+strconv.Itoa(hours)+" 小时后再提醒你。")
+		return true
+	default:
+		_ = feishu.ReplyMessage(cfg.FeishuAppID, cfg.FeishuAppSecret, messageID, "WILL：本次不更新，之后有新版本会再提醒。")
+		return true
+	}
+}
+
+func runVersionCheck(s *store.Store) {
+	tick := time.NewTicker(24 * time.Hour)
+	defer tick.Stop()
+	for range tick.C {
+		doVersionCheck(s)
+	}
+}
+
+func doVersionCheck(s *store.Store) {
+	cfg := config.LoadFromStore(s)
+	if cfg.FeishuAppID == "" || cfg.FeishuAppSecret == "" {
+		return
+	}
+	allowed := s.GetAllowedOpenIDs()
+	if len(allowed) == 0 {
+		return
+	}
+	latestVer, _, err := updater.CheckLatest()
+	if err != nil {
+		return
+	}
+	current := strings.TrimPrefix(Version, "v")
+	if !updater.CompareVersion(latestVer, current) {
+		return
+	}
+	promptAt, _ := s.GetConfig(store.ConfigKeyUpdatePromptAt)
+	if promptAt != "" {
+		ts, _ := strconv.ParseInt(promptAt, 10, 64)
+		if time.Since(time.Unix(ts, 0)) < updatePromptMaxAge {
+			return
+		}
+	}
+	s.SetConfig(store.ConfigKeyLatestVersion, latestVer)
+	s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
+	s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, allowed[0])
+	msg := "WILL 发现新版本 v" + latestVer + "，是否更新？回复「立即更新」或「稍后再说」或「X 小时后提醒」。"
+	if err := feishu.SendMessageToUser(cfg.FeishuAppID, cfg.FeishuAppSecret, allowed[0], msg); err != nil {
+		log.Printf("send update prompt: %v", err)
+	}
+}
+
+func runScheduledTasks(s *store.Store) {
+	tick := time.NewTicker(time.Minute)
+	defer tick.Stop()
+	for range tick.C {
+		now := time.Now().Unix()
+		tasks, err := s.ListScheduledTasksDue(now)
+		if err != nil || len(tasks) == 0 {
+			continue
+		}
+		cfg := config.LoadFromStore(s)
+		for _, t := range tasks {
+			_ = s.DeleteScheduledTask(t.ID)
+			switch t.Kind {
+			case "do_version_check":
+				doVersionCheck(s)
+			case "remind_update":
+				var payload struct {
+					Version string `json:"version"`
+					OpenID  string `json:"open_id"`
+				}
+				_ = json.Unmarshal([]byte(t.Payload), &payload)
+				if payload.OpenID != "" && cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
+					msg := "WILL 提醒：新版本 v" + payload.Version + " 仍未更新，是否现在更新？回复「立即更新」或「稍后」或「不更新」。"
+					_ = feishu.SendMessageToUser(cfg.FeishuAppID, cfg.FeishuAppSecret, payload.OpenID, msg)
+					s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
+					s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, payload.OpenID)
+					s.SetConfig(store.ConfigKeyLatestVersion, payload.Version)
+				}
+			}
+		}
 	}
 }
 
