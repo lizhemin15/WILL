@@ -23,7 +23,7 @@ func TestCredentials(appID, appSecret string) error {
 	cli := lark.NewClient(appID, appSecret)
 	ctx := context.Background()
 	req := &larkcore.SelfBuiltTenantAccessTokenReq{
-		AppId:     appID,
+		AppID:     appID,
 		AppSecret: appSecret,
 	}
 	_, err := cli.GetTenantAccessTokenBySelfBuiltApp(ctx, req)
