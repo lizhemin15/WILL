@@ -18,6 +18,9 @@ import (
 const maxHistoryRunes = 400 // 注入 LLM 的每条历史消息最大长度，防 token 爆炸
 const maxHistoryMessages = 10 // 最近对话轮数（约 5 轮）
 
+// llmClient 专用 HTTP 客户端，超时独立于全局 DefaultClient
+var llmClient = &http.Client{Timeout: 120 * time.Second}
+
 // AllowedConfigKeys 允许通过 LLM 写入的配置键（与 store 一致）
 var AllowedConfigKeys = map[string]string{
 	"feishu_app_id":     store.ConfigKeyFeishuAppID,
@@ -77,7 +80,7 @@ func TestConfig(cfg *config.Config) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := llmClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("LLM 连接失败: %w", err)
 	}
@@ -110,7 +113,7 @@ func CallChat(cfg *config.Config, systemPrompt, userContent string) (string, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := llmClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -209,7 +212,7 @@ config key 仅限：feishu_app_id, feishu_app_secret, llm_api_key, llm_base_url,
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := llmClient.Do(req)
 		if err != nil {
 			return out, err
 		}
@@ -344,7 +347,7 @@ func CallForInstruction(cfg *config.Config, userScope string, instruction string
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := llmClient.Do(req)
 	if err != nil {
 		return "", err
 	}
