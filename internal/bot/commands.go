@@ -87,11 +87,12 @@ func cmdConfig(args []string, s *store.Store, cfg *config.Config) string {
 		"feishu_app_secret":  store.ConfigKeyFeishuAppSecret,
 		"llm_api_key":       store.ConfigKeyLLMApiKey,
 		"llm_base_url":       store.ConfigKeyLLMBaseURL,
-		"llm_model":          store.ConfigKeyLLMModel,
+		"llm_model":             store.ConfigKeyLLMModel,
+		"feishu_subscribe_mode": store.ConfigKeyFeishuSubscribeMode,
 	}
 	configKey, ok := allowedKeys[key]
 	if !ok {
-		return "未知 key，可用: mode, internal_token, worker_urls, port, bind, feishu_app_id, feishu_app_secret, llm_api_key, llm_base_url, llm_model"
+		return "未知 key，可用: mode, internal_token, worker_urls, port, bind, feishu_app_id, feishu_app_secret, llm_api_key, llm_base_url, llm_model, feishu_subscribe_mode"
 	}
 	if err := s.SetConfig(configKey, value); err != nil {
 		return "写入失败: " + err.Error()
@@ -121,6 +122,7 @@ func cmdConfigGet(s *store.Store, cfg *config.Config) string {
 	out += "internal_token: " + mask(cfg.InternalToken) + "\n"
 	out += "allowed_open_ids: " + strings.Join(cfg.FeishuAllowed, ",") + "\n"
 	out += "worker_urls: " + strings.Join(cfg.WorkerURLs, ",") + "\n"
+	out += "feishu_subscribe_mode: " + cfg.FeishuSubscribeMode + "\n"
 	return out
 }
 

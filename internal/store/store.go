@@ -27,6 +27,7 @@ const (
 	ConfigKeyLatestVersion    = "latest_version"
 	ConfigKeyUpdatePromptAt   = "update_prompt_at"
 	ConfigKeyUpdateNotifyOpenID = "update_notify_open_id"
+	ConfigKeyFeishuSubscribeMode = "feishu_subscribe_mode" // "webhook" | "ws"
 )
 
 type Store struct {

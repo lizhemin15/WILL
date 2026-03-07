@@ -28,8 +28,9 @@ type Config struct {
 	FeishuAppSecret string
 	FeishuAllowed   []string
 
-	InternalToken string
-	WorkerURLs    []string
+	InternalToken    string
+	WorkerURLs       []string
+	FeishuSubscribeMode string // "webhook" | "ws"，默认 ws（长连接）
 }
 
 // Load 仅从环境变量加载（worker 模式或未提供 store 时）
@@ -89,6 +90,10 @@ func loadFrom(s *store.Store) *Config {
 	}
 
 	internalToken := get("WILL_INTERNAL_TOKEN", store.ConfigKeyInternalToken, "")
+	subscribeMode := get("FEISHU_SUBSCRIBE_MODE", store.ConfigKeyFeishuSubscribeMode, "ws")
+	if subscribeMode != "webhook" {
+		subscribeMode = "ws"
+	}
 
 	return &Config{
 		Mode:            mode,
@@ -100,7 +105,8 @@ func loadFrom(s *store.Store) *Config {
 		FeishuAppID:     get("FEISHU_APP_ID", store.ConfigKeyFeishuAppID, ""),
 		FeishuAppSecret: get("FEISHU_APP_SECRET", store.ConfigKeyFeishuAppSecret, ""),
 		FeishuAllowed:   allowed,
-		InternalToken:   internalToken,
-		WorkerURLs:      workerURLs,
+		InternalToken:       internalToken,
+		WorkerURLs:          workerURLs,
+		FeishuSubscribeMode: subscribeMode,
 	}
 }

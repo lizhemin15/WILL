@@ -2,4 +2,7 @@ module github.com/yourusername/will
 
 go 1.22
 
-require modernc.org/sqlite v1.29.0
+require (
+	github.com/larksuite/oapi-sdk-go/v3 v3.0.14
+	modernc.org/sqlite v1.29.0
+)

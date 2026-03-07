@@ -1,170 +1,71 @@
 package feishu
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
-	"net/http"
 	"sync"
-	"time"
+
+	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
-const (
-	authURL      = "https://open.feishu.cn/open_apis/auth/v3/tenant_access_token/internal"
-	replyFmt     = "https://open.feishu.cn/open_apis/im/v1/messages/%s/reply"
-	sendMessageURL = "https://open.feishu.cn/open_apis/im/v1/messages?receive_id_type=open_id"
-	tokenTTL     = 7000 * time.Second
-	userAgent    = "WILL/1.0"
+var (
+	globalClient *lark.Client
+	clientMu     sync.RWMutex
 )
 
-type tokenHolder struct {
-	mu    sync.Mutex
-	token string
-	exp   time.Time
+// InitClient 使用 appID、appSecret 初始化全局飞书 SDK 客户端，回复与发消息均通过该客户端
+func InitClient(appID, appSecret string) {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	globalClient = lark.NewClient(appID, appSecret)
 }
 
-var globalToken tokenHolder
-
-func getTenantAccessToken(appID, appSecret string) (string, error) {
-	globalToken.mu.Lock()
-	defer globalToken.mu.Unlock()
-	if globalToken.token != "" && time.Now().Before(globalToken.exp) {
-		return globalToken.token, nil
-	}
-
-	body, _ := json.Marshal(map[string]string{
-		"app_id":     appID,
-		"app_secret": appSecret,
-	})
-	req, err := http.NewRequest(http.MethodPost, authURL, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("User-Agent", userAgent)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var out struct {
-		Code  int    `json:"code"`
-		Msg   string `json:"msg"`
-		Token string `json:"tenant_access_token"`
-		Expire int   `json:"expire"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	if out.Code != 0 {
-		return "", fmt.Errorf("feishu auth: code=%d msg=%s", out.Code, out.Msg)
-	}
-
-	globalToken.token = out.Token
-	expSec := out.Expire
-	if expSec <= 0 {
-		expSec = 7200
-	}
-	globalToken.exp = time.Now().Add(time.Duration(expSec) * time.Second)
-	return globalToken.token, nil
+func getClient() *lark.Client {
+	clientMu.RLock()
+	defer clientMu.RUnlock()
+	return globalClient
 }
 
-func ReplyMessage(appID, appSecret, messageID, text string) error {
-	token, err := getTenantAccessToken(appID, appSecret)
+// ReplyMessage 回复指定消息（通过 SDK Im.Message.Reply）
+func ReplyMessage(messageID, text string) error {
+	cli := getClient()
+	if cli == nil {
+		return fmt.Errorf("feishu client not initialized")
+	}
+	content := larkim.NewTextMsgBuilder().Text(text).Build()
+	req := larkim.NewReplyMessageReqBuilder().
+		MessageId(messageID).
+		Body(larkim.NewReplyMessageReqBodyBuilder().
+			Content(content).
+			MsgType(larkim.MsgTypeText).
+			Build()).
+		Build()
+	_, err := cli.Im.Message.Reply(context.Background(), req)
 	if err != nil {
-		return err
-	}
-
-	payload := map[string]string{
-		"msg_type": "text",
-		"content":  `{"text":"` + escapeJSONString(text) + `"}`,
-	}
-	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf(replyFmt, messageID)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", userAgent)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var out struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return err
-	}
-	if out.Code != 0 {
-		return fmt.Errorf("feishu reply: code=%d msg=%s", out.Code, out.Msg)
+		return fmt.Errorf("feishu reply: %w", err)
 	}
 	return nil
 }
 
-// SendMessageToUser 主动给用户发消息（用于更新提醒等）
-func SendMessageToUser(appID, appSecret, openID, text string) error {
-	token, err := getTenantAccessToken(appID, appSecret)
+// SendMessageToUser 主动给用户发消息（通过 SDK Im.Message.Create，receive_id_type=open_id）
+func SendMessageToUser(openID, text string) error {
+	cli := getClient()
+	if cli == nil {
+		return fmt.Errorf("feishu client not initialized")
+	}
+	content := larkim.NewTextMsgBuilder().Text(text).Build()
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(larkim.ReceiveIdTypeOpenId).
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			MsgType(larkim.MsgTypeText).
+			ReceiveId(openID).
+			Content(content).
+			Build()).
+		Build()
+	_, err := cli.Im.Message.Create(context.Background(), req)
 	if err != nil {
-		return err
-	}
-	payload := map[string]string{
-		"receive_id": openID,
-		"msg_type":   "text",
-		"content":    `{"text":"` + escapeJSONString(text) + `"}`,
-	}
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, sendMessageURL, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", userAgent)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return err
-	}
-	if out.Code != 0 {
-		return fmt.Errorf("feishu send message: code=%d msg=%s", out.Code, out.Msg)
+		return fmt.Errorf("feishu send message: %w", err)
 	}
 	return nil
-}
-
-func escapeJSONString(s string) string {
-	var b []byte
-	for _, r := range s {
-		switch r {
-		case '"', '\\':
-			b = append(b, '\\', byte(r))
-		case '\n':
-			b = append(b, '\\', 'n')
-		case '\r':
-			b = append(b, '\\', 'r')
-		case '\t':
-			b = append(b, '\\', 't')
-		default:
-			if r < 32 {
-				continue
-			}
-			b = append(b, string(r)...)
-		}
-	}
-	return string(b)
 }
