@@ -8,10 +8,14 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/yourusername/will/internal/config"
 	"github.com/yourusername/will/internal/store"
 )
+
+const maxHistoryRunes = 400 // 注入 LLM 的每条历史消息最大长度，防 token 爆炸
+const maxHistoryMessages = 10 // 最近对话轮数（约 5 轮）
 
 // AllowedConfigKeys 允许通过 LLM 写入的配置键（与 store 一致）
 var AllowedConfigKeys = map[string]string{
@@ -120,12 +124,22 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 		}
 	}
 
+	messages := []map[string]string{{"role": "system", "content": sys}}
+	if s != nil {
+		openID := strings.TrimPrefix(userScope, "user:")
+		history, err := s.GetRecentConversation(openID, maxHistoryMessages)
+		if err == nil && len(history) > 0 {
+			for _, m := range history {
+				content := truncateRunes(m.Content, maxHistoryRunes)
+				messages = append(messages, map[string]string{"role": m.Role, "content": content})
+			}
+		}
+	}
+	messages = append(messages, map[string]string{"role": "user", "content": userMessage})
+
 	body := map[string]interface{}{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "system", "content": sys},
-			{"role": "user", "content": userMessage},
-		},
+		"model":    model,
+		"messages": messages,
 		"max_tokens": 1024,
 	}
 	bodyBytes, _ := json.Marshal(body)
@@ -175,21 +189,51 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 	return out, nil
 }
 
-// Apply 将 LLM 返回的 config/memory 写入 store，并返回要执行的 command 和回复文案
+// PendingConfigKey 存在此 key 时表示有待用户确认的配置变更（值为 JSON map[storeKey]value）
+const PendingConfigKey = "pending_config"
+
+// Apply 将 LLM 返回的 config/memory 写入 store；配置类修改不直接生效，写入待确认，需用户回复「确认」后才生效
 func Apply(s *store.Store, openID string, r Response) (command string, reply string) {
 	if s == nil {
 		return r.Command, r.Reply
 	}
-	for k, v := range r.Config {
-		if storeKey, ok := AllowedConfigKeys[strings.ToLower(strings.TrimSpace(k))]; ok {
-			_ = s.SetConfig(storeKey, strings.TrimSpace(v))
+	scope := "user:" + openID
+	// 配置变更：一律进入待确认，不直接写 SetConfig
+	if len(r.Config) > 0 {
+		pending := make(map[string]string)
+		var keys []string
+		for k, v := range r.Config {
+			k = strings.ToLower(strings.TrimSpace(k))
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			storeKey, ok := AllowedConfigKeys[k]
+			if !ok {
+				continue
+			}
+			pending[storeKey] = v
+			keys = append(keys, k)
+		}
+		if len(pending) > 0 {
+			sort.Strings(keys)
+			jsonBytes, _ := json.Marshal(pending)
+			_ = s.SetMemory(scope, PendingConfigKey, string(jsonBytes))
+			return "", "将修改以下配置，请回复「确认」生效或「取消」忽略：" + strings.Join(keys, "、")
 		}
 	}
-	scope := "user:" + openID
+	// 无配置变更时，照常写 memory
 	for k, v := range r.Memory {
 		_ = s.SetMemory(scope, strings.TrimSpace(k), strings.TrimSpace(v))
 	}
 	return strings.TrimSpace(r.Command), r.Reply
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 || utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	return string([]rune(s)[:max]) + "…"
 }
 
 func extractJSON(s string) string {

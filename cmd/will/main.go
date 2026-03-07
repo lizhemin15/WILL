@@ -266,18 +266,61 @@ func processFeishuMessage(s *store.Store, openID, messageID, text string) (reply
 		_, _ = s.AddScheduledTask("do_version_check", "", time.Now().Add(2*time.Minute).Unix())
 	}
 	if len(cfg.FeishuAllowed) > 0 && !feishu.IsAllowed(openID, cfg.FeishuAllowed) {
-		return "未授权用户，忽略。", true
+		reply, sendReply = "未授权用户，忽略。", true
+		goto done
 	}
 	if s != nil && tryHandleUpdateReply(s, cfg, openID, text, messageID) {
 		return "", false // 已在 tryHandleUpdateReply 内回复
 	}
-	if rpl, ok := bot.HandleCommand(text, openID, s, cfg); ok {
-		return rpl, true
+	if s != nil {
+		if rpl, ok := handlePendingConfigConfirm(s, openID, strings.TrimSpace(text)); ok {
+			reply, sendReply = rpl, true
+			goto done
+		}
 	}
-	return runWithLLM(s, cfg, openID, text), true
+	if rpl, ok := bot.HandleCommand(text, openID, s, cfg); ok {
+		reply, sendReply = rpl, true
+		goto done
+	}
+	reply, sendReply = runWithLLM(s, cfg, openID, text), true
+done:
+	if sendReply && s != nil && openID != "" && reply != "" {
+		_ = s.AppendConversation(openID, "user", text)
+		_ = s.AppendConversation(openID, "assistant", reply)
+	}
+	return reply, sendReply
 }
 
 const updatePromptMaxAge = 24 * time.Hour
+
+// handlePendingConfigConfirm 若有待确认的配置变更，根据用户回复「确认」/「取消」生效或丢弃，返回 (回复, 是否已处理)
+func handlePendingConfigConfirm(s *store.Store, openID, text string) (reply string, handled bool) {
+	scope := "user:" + openID
+	pending, ok := s.GetMemory(scope, llm.PendingConfigKey)
+	if !ok || pending == "" {
+		return "", false
+	}
+	lower := strings.ToLower(text)
+	isConfirm := lower == "确认" || lower == "是" || lower == "好" || lower == "可以" || lower == "生效" || lower == "ok" || lower == "yes"
+	isCancel := lower == "取消" || lower == "不" || lower == "否" || lower == "忽略" || lower == "不要" || lower == "no"
+	if isConfirm {
+		var m map[string]string
+		if err := json.Unmarshal([]byte(pending), &m); err != nil {
+			s.SetMemory(scope, llm.PendingConfigKey, "")
+			return "配置解析失败，已清除待确认。", true
+		}
+		for k, v := range m {
+			_ = s.SetConfig(k, v)
+		}
+		s.SetMemory(scope, llm.PendingConfigKey, "")
+		return "配置已生效。", true
+	}
+	if isCancel {
+		s.SetMemory(scope, llm.PendingConfigKey, "")
+		return "已取消。", true
+	}
+	return "请先回复「确认」或「取消」以处理待生效的配置变更。", true
+}
 
 func tryHandleUpdateReply(s *store.Store, cfg *config.Config, openID, text, messageID string) bool {
 	promptAt, _ := s.GetConfig(store.ConfigKeyUpdatePromptAt)

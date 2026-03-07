@@ -94,6 +94,14 @@ func (s *Store) migrate() error {
 			created_at INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_todos_open_id ON todos(open_id);
+		CREATE TABLE IF NOT EXISTS conversation (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			open_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_conversation_open_id ON conversation(open_id);
 	`)
 	return err
 }
@@ -298,4 +306,66 @@ func (s *Store) DeleteTodo(id int64, openID string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// ConvMessage 单条对话（user 或 assistant）
+type ConvMessage struct {
+	Role    string
+	Content string
+}
+
+const keepConversationRows = 50 // 每用户最多保留条数，超出删最旧的
+
+// AppendConversation 追加一条对话；每用户仅保留最近 keepConversationRows 条
+func (s *Store) AppendConversation(openID, role, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	_, err := s.db.Exec(
+		"INSERT INTO conversation (open_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+		openID, role, content, now,
+	)
+	if err != nil {
+		return err
+	}
+	var count int
+	_ = s.db.QueryRow("SELECT COUNT(*) FROM conversation WHERE open_id = ?", openID).Scan(&count)
+	if count > keepConversationRows {
+		toDelete := count - keepConversationRows
+		_, _ = s.db.Exec(
+			"DELETE FROM conversation WHERE open_id = ? AND id IN (SELECT id FROM conversation WHERE open_id = ? ORDER BY id ASC LIMIT ?)",
+			openID, openID, toDelete,
+		)
+	}
+	return nil
+}
+
+// GetRecentConversation 按时间正序返回该用户最近 maxMessages 条对话（用于拼进 LLM 上下文）
+func (s *Store) GetRecentConversation(openID string, maxMessages int) ([]ConvMessage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(
+		"SELECT role, content FROM conversation WHERE open_id = ? ORDER BY id DESC LIMIT ?",
+		openID, maxMessages,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []ConvMessage
+	for rows.Next() {
+		var m ConvMessage
+		if err := rows.Scan(&m.Role, &m.Content); err != nil {
+			return nil, err
+		}
+		list = append(list, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 倒序成时间正序（最旧在前）
+	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+		list[i], list[j] = list[j], list[i]
+	}
+	return list, nil
 }
