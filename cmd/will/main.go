@@ -282,12 +282,20 @@ func isVersionCheckRequest(text string) bool {
 	if t == "" {
 		return false
 	}
-	t = strings.ToLower(t)
-	keywords := []string{"检查新版本", "检查更新", "有没有新版本", "查版本", "检查版本", "更新检查", "/version"}
+	lower := strings.ToLower(t)
+	keywords := []string{
+		"检查新版本", "检查更新", "有没有新版本", "查版本", "检查版本", "更新检查",
+		"查更新", "看看有没有更新", "有没有更新", "新版本", "检查一下版本",
+		"/version", "version",
+	}
 	for _, k := range keywords {
-		if t == k || strings.Contains(t, k) {
+		if lower == k || strings.Contains(lower, k) {
 			return true
 		}
+	}
+	// 纯「更新」「版本」等短句也视为查版本
+	if len(t) <= 6 && (strings.Contains(lower, "更新") || strings.Contains(lower, "版本")) {
+		return true
 	}
 	return false
 }
@@ -444,6 +452,14 @@ func runTask(cfg *config.Config, instruction string) string {
 	instruction = strings.TrimSpace(instruction)
 	if instruction == "" {
 		return "收到空指令。"
+	}
+	// 拦截 git 命令，避免在非 git 目录报错；检查版本请说「检查新版本」
+	firstWord := instruction
+	if i := strings.IndexAny(instruction, " \t"); i > 0 {
+		firstWord = instruction[:i]
+	}
+	if strings.ToLower(firstWord) == "git" {
+		return "检查版本请说「检查新版本」，按 GitHub 发布版本检查，无需 git。"
 	}
 
 	if cfg.Mode == config.ModeMain && len(cfg.WorkerURLs) > 0 && cfg.InternalToken != "" {
