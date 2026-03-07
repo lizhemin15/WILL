@@ -57,9 +57,12 @@ func ReplyMessage(messageID, text string) error {
 			MsgType(larkim.MsgTypeText).
 			Build()).
 		Build()
-	_, err := cli.Im.Message.Reply(context.Background(), req)
+	resp, err := cli.Im.Message.Reply(context.Background(), req)
 	if err != nil {
 		return fmt.Errorf("feishu reply: %w", err)
+	}
+	if resp != nil && resp.Code != 0 {
+		return fmt.Errorf("feishu reply code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return nil
 }
@@ -79,9 +82,13 @@ func SendMessageToUser(openID, text string) error {
 			Content(content).
 			Build()).
 		Build()
-	_, err := cli.Im.Message.Create(context.Background(), req)
+	resp, err := cli.Im.Message.Create(context.Background(), req)
 	if err != nil {
 		return fmt.Errorf("feishu send message: %w", err)
+	}
+	// 飞书 API 可能 HTTP 200 但 body 里 code!=0（如 230013 机器人对该用户无可用性）
+	if resp != nil && resp.Code != 0 {
+		return fmt.Errorf("feishu code=%d msg=%s（若为 230013 请在开放平台「应用发布」→「可用性」里把测试用户加入并发布）", resp.Code, resp.Msg)
 	}
 	return nil
 }
