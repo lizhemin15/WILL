@@ -409,7 +409,7 @@ func runScheduledTasks(s *store.Store) {
 
 // runWithLLM 用 LLM 解析用户意图，再按 intent 分发或执行 command/回复
 func runWithLLM(s *store.Store, cfg *config.Config, openID string, userMessage string) string {
-	resp, err := llm.Call(cfg, "user:"+openID, userMessage)
+	resp, err := llm.Call(cfg, "user:"+openID, userMessage, s)
 	if err != nil {
 		return "LLM 调用失败 — " + err.Error()
 	}

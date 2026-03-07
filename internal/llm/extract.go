@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/yourusername/will/internal/config"
@@ -74,8 +76,8 @@ func TestConfig(cfg *config.Config) error {
 	return nil
 }
 
-// Call 调用 LLM，解析出 config/memory/command/reply
-func Call(cfg *config.Config, userScope string, userMessage string) (Response, error) {
+// Call 调用 LLM，解析出 config/memory/command/reply；若 s 非空则从 SQLite 拉取该用户记忆作为上下文
+func Call(cfg *config.Config, userScope string, userMessage string, s *store.Store) (Response, error) {
 	var out Response
 	if cfg.LLMApiKey == "" {
 		return out, fmt.Errorf("未配置 LLM（OPENAI_API_KEY 或 llm_api_key）")
@@ -102,6 +104,22 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 
 说明：config 的 key 仅限 feishu_app_id, feishu_app_secret, mode, internal_token, worker_urls, port, bind, llm_api_key, llm_base_url, llm_model。不要用 git 检查版本，用户说检查更新时 intent 填 version_check 即可。`
 
+	if s != nil {
+		mem, err := s.ListMemory(userScope)
+		if err == nil && len(mem) > 0 {
+			keys := make([]string, 0, len(mem))
+			for k := range mem {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			var lines []string
+			for _, k := range keys {
+				lines = append(lines, k+": "+mem[k])
+			}
+			sys += "\n\n当前用户记忆（可引用、需更新时在 memory 里返回）：\n" + strings.Join(lines, "\n")
+		}
+	}
+
 	body := map[string]interface{}{
 		"model": model,
 		"messages": []map[string]string{
@@ -125,6 +143,14 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		msg := string(body)
+		if len(msg) > 300 {
+			msg = msg[:300] + "..."
+		}
+		if msg != "" {
+			return out, fmt.Errorf("LLM 请求失败: %d — %s", resp.StatusCode, strings.TrimSpace(msg))
+		}
 		return out, fmt.Errorf("LLM 请求失败: %d", resp.StatusCode)
 	}
 
