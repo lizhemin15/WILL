@@ -33,6 +33,7 @@ const (
 	ConfigKeyFeishuSubscribeMode    = "feishu_subscribe_mode"
 	ConfigKeyTimezone               = "timezone"
 	ConfigKeyMainURL                = "main_url"
+	ConfigKeyWorkerName             = "worker_name"
 
 	KindUserScheduled   = "user_scheduled"
 	KindDoVersionCheck  = "do_version_check"

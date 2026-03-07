@@ -11,9 +11,9 @@ import (
 )
 
 // PairWithMain 向主节点发起配对请求，不使用 Bearer 鉴权（令牌在请求体中）
-func PairWithMain(ctx context.Context, mainURL, token, workerURL string) (*PairResponse, error) {
+func PairWithMain(ctx context.Context, mainURL, token, workerName string) (*PairResponse, error) {
 	mainURL = strings.TrimRight(mainURL, "/")
-	reqBody := PairRequest{Token: token, WorkerURL: workerURL}
+	reqBody := PairRequest{Token: token, WorkerName: workerName}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err

@@ -144,10 +144,39 @@ var toolDefs = []map[string]interface{}{
 		"type": "function",
 		"function": map[string]interface{}{
 			"name":        "shell_exec",
-			"description": "执行 shell 命令并返回输出",
+			"description": "在当前节点执行 shell 命令并返回输出",
 			"parameters": objectParams(map[string]interface{}{
 				"command": strParam("要执行的 shell 命令"),
 			}, "command"),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "worker_list",
+			"description": "列出所有已连接的从节点（子机器人）名称和状态，主节点模式下可用",
+			"parameters":  emptyParams(),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "worker_exec",
+			"description": "在指定名称的从节点上执行 shell 命令，用于控制其他机器上的机器人。用户说「让<名称>执行」「在<名称>上运行」时使用此工具",
+			"parameters": objectParams(map[string]interface{}{
+				"worker_name": strParam("从节点名称，必须与 worker_list 返回的名称完全一致"),
+				"command":     strParam("要在从节点上执行的 shell 命令"),
+			}, "worker_name", "command"),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "worker_update",
+			"description": "触发指定从节点（子机器人）升级到最新版本，升级完成后从节点会自动重启并重新连接",
+			"parameters": objectParams(map[string]interface{}{
+				"worker_name": strParam("要升级的从节点名称，必须与 worker_list 返回的名称完全一致"),
+			}, "worker_name"),
 		},
 	},
 }

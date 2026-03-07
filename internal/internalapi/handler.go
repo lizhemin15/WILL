@@ -94,14 +94,18 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 // PairRequest 从节点发起配对请求
 type PairRequest struct {
-	Token     string `json:"token"`
-	WorkerURL string `json:"worker_url"` // 从节点对外可访问地址，主节点用于回调
+	Token      string `json:"token"`
+	WorkerURL  string `json:"worker_url"`  // 保留字段（现已不需要，WebSocket 模式下从节点主动连出）
+	WorkerName string `json:"worker_name"` // 从节点自定义名称
 }
 
-// PairResponse 主节点返回配对结果
+// PairResponse 主节点返回配对结果，同时携带 LLM 配置供从节点继承
 type PairResponse struct {
 	OK          bool   `json:"ok"`
 	WorkerToken string `json:"worker_token,omitempty"`
+	LLMApiKey   string `json:"llm_api_key,omitempty"`
+	LLMBaseURL  string `json:"llm_base_url,omitempty"`
+	LLMModel    string `json:"llm_model,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
 
@@ -149,6 +153,17 @@ func HandlePair(s *store.Store) http.HandlerFunc {
 			_ = s.SetConfig(store.ConfigKeyWorkerURLs, strings.Join(urls, ","))
 		}
 
-		writeJSON(w, http.StatusOK, PairResponse{OK: true, WorkerToken: internalToken})
+		// 将主节点 LLM 配置一并返回，从节点无需单独配置
+		llmKey, _ := s.GetConfig(store.ConfigKeyLLMApiKey)
+		llmBase, _ := s.GetConfig(store.ConfigKeyLLMBaseURL)
+		llmModel, _ := s.GetConfig(store.ConfigKeyLLMModel)
+
+		writeJSON(w, http.StatusOK, PairResponse{
+			OK:          true,
+			WorkerToken: internalToken,
+			LLMApiKey:   llmKey,
+			LLMBaseURL:  llmBase,
+			LLMModel:    llmModel,
+		})
 	}
 }

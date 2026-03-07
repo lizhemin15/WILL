@@ -74,9 +74,14 @@ func main() {
 	switch cfg.Mode {
 	case config.ModeWorker:
 		// 从节点：通过 WebSocket 连接主节点，无需暴露端口
-		wc := &peer.WorkerClient{MainURL: cfg.MainURL, Token: cfg.InternalToken}
+		wc := &peer.WorkerClient{
+			MainURL: cfg.MainURL,
+			Token:   cfg.InternalToken,
+			Name:    cfg.WorkerName,
+			Store:   s,
+		}
 		go wc.Start(context.Background())
-		log.Printf("[worker] 从节点已启动，连接主节点 %s", cfg.MainURL)
+		log.Printf("[worker] 从节点「%s」已启动，连接主节点 %s", cfg.WorkerName, cfg.MainURL)
 		select {}
 	case config.ModeMain:
 		// 主节点：创建 hub，启动 HTTP 服务（pair + WebSocket）
@@ -148,6 +153,16 @@ func processFeishuMessage(s *store.Store, cfg *config.Config, openID, text, mess
 	// 待确认配置变更拦截
 	if rpl, ok := handlePendingConfigConfirm(s, openID, strings.TrimSpace(text)); ok {
 		reply, sendReply = rpl, true
+		goto done
+	}
+
+	// /workers 列出从节点
+	if strings.ToLower(strings.TrimSpace(text)) == "/workers" {
+		if globalHub != nil {
+			reply, sendReply = globalHub.WorkersText(), true
+		} else {
+			reply, sendReply = "当前为独立或从节点模式，无从节点管理功能。", true
+		}
 		goto done
 	}
 
@@ -414,6 +429,50 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		var p struct{ Command string `json:"command"` }
 		_ = json.Unmarshal(argsJSON, &p)
 		return runTask(s, cfg, strings.TrimSpace(p.Command))
+
+	case "worker_list":
+		if globalHub == nil {
+			return "当前不是主节点模式，无从节点管理。"
+		}
+		return globalHub.WorkersText()
+
+	case "worker_exec":
+		var p struct {
+			WorkerName string `json:"worker_name"`
+			Command    string `json:"command"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		if globalHub == nil {
+			return "当前不是主节点模式。"
+		}
+		if p.WorkerName == "" || p.Command == "" {
+			return "请指定从节点名称和要执行的命令。"
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		res, err := globalHub.ExecNamed(ctx, p.WorkerName, p.Command, "", 300)
+		if err != nil {
+			return fmt.Sprintf("从节点「%s」执行失败: %v", p.WorkerName, err)
+		}
+		return peer.FormatResult(res)
+
+	case "worker_update":
+		var p struct {
+			WorkerName string `json:"worker_name"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		if globalHub == nil {
+			return "当前不是主节点模式。"
+		}
+		if p.WorkerName == "" {
+			return "请指定要升级的从节点名称。"
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := globalHub.TriggerUpdate(ctx, p.WorkerName); err != nil {
+			return fmt.Sprintf("触发从节点「%s」升级失败: %v", p.WorkerName, err)
+		}
+		return fmt.Sprintf("已向从节点「%s」发送升级指令，升级完成后将自动重连。", p.WorkerName)
 
 	default:
 		return fmt.Sprintf("未知工具: %s", name)

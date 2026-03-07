@@ -96,6 +96,7 @@ func cmdHelp() string {
 /config <key> <v>  — 修改配置（llm_api_key、llm_base_url、llm_model 等）
 /allow me          — 将当前用户加入授权列表
 /pair              — 生成从节点配对码（10分钟有效，用于绑定新机器人）
+/workers           — 列出所有已连接的从节点名称
 
 自然语言也可：直接说「添加待办 xxx」「每天9点提醒我」「现在几点」等，AI 会直接处理。`
 }

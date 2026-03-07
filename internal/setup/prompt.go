@@ -3,6 +3,8 @@ package setup
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -15,43 +17,51 @@ import (
 	"github.com/yourusername/will/internal/store"
 )
 
+func randomShortID() string {
+	b := make([]byte, 3)
+	_, _ = rand.Read(b)
+	return strings.ToUpper(hex.EncodeToString(b))
+}
+
 const urlHint = "只填到域名或 /v1，不要加 /chat/completions 等路径。例如: https://api.openai.com/v1"
 
-// RunStartup 启动时检测配置：LLM 必须配置；首次部署时询问通信方式（飞书 或 机器人间通信）。
+// RunStartup 启动时完成初始化：
+//   - 首次运行（DB 中无 mode 记录且未设 WILL_MODE 环境变量）：先问通信方式
+//   - 从节点模式：直接启动，LLM 配置由主节点下发
+//   - 飞书模式：确保 LLM + 飞书凭证有效
 func RunStartup(s *store.Store) *config.Config {
 	if s == nil {
 		return nil
 	}
-	_ = ensureLLM(s)
 
 	cfg := config.LoadFromStore(s)
 
-	// 已配置为从节点模式，跳过后续询问
+	// 从节点模式（来自 DB 或 WILL_MODE 环境变量）：无需额外配置
 	if cfg.Mode == config.ModeWorker {
-		fmt.Fprintln(os.Stdout, "[WILL] 从节点模式，跳过飞书配置。")
+		fmt.Fprintln(os.Stdout, "[WILL] 从节点模式启动，配置已就绪。")
 		return cfg
 	}
 
-	// 飞书已配置（重启场景），只做校验无需重新选择模式
-	if cfg.FeishuAppID != "" || cfg.FeishuAppSecret != "" {
-		ensureFeishuOrSkip(s)
-		return config.LoadFromStore(s)
+	// 判断是否首次运行：DB 里没有 mode 记录，且未通过环境变量指定模式
+	_, modeInDB := s.GetConfig(store.ConfigKeyMode)
+	if !modeInDB && os.Getenv("WILL_MODE") == "" {
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Fprintln(os.Stdout, "欢迎使用 WILL！首次运行，请完成初始配置。")
+		fmt.Fprintln(os.Stdout, "")
+		fmt.Fprintln(os.Stdout, "选择通信方式：")
+		fmt.Fprintln(os.Stdout, "  [1] 飞书通信（主节点 / 独立节点，直接通过飞书消息控制）")
+		fmt.Fprintln(os.Stdout, "  [2] 机器人间通信（从节点，绑定到已有的飞书主节点机器人）")
+		fmt.Fprint(os.Stdout, "请选择 [1/2]（默认 1）: ")
+		line, _ := reader.ReadString('\n')
+		if strings.TrimSpace(line) == "2" {
+			return ensurePeerPairing(s, reader)
+		}
+		// 记录模式到 DB，下次启动不再询问
+		_ = s.SetConfig(store.ConfigKeyMode, string(config.ModeStandalone))
 	}
 
-	// 首次部署：询问通信方式
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Fprintln(os.Stdout, "")
-	fmt.Fprintln(os.Stdout, "选择通信方式：")
-	fmt.Fprintln(os.Stdout, "  [1] 飞书通信（直接与飞书机器人对话，主节点 / 独立节点）")
-	fmt.Fprintln(os.Stdout, "  [2] 机器人间通信（作为从节点绑定到已有的飞书机器人上）")
-	fmt.Fprint(os.Stdout, "请选择 [1/2]（默认 1）: ")
-	choice, _ := reader.ReadString('\n')
-	choice = strings.TrimSpace(choice)
-
-	if choice == "2" {
-		return ensurePeerPairing(s, reader)
-	}
-
+	// 飞书模式：确保 LLM 和飞书凭证有效
+	_ = ensureLLM(s)
 	ensureFeishuOrSkip(s)
 	return config.LoadFromStore(s)
 }
@@ -63,6 +73,14 @@ func ensurePeerPairing(s *store.Store, reader *bufio.Reader) *config.Config {
 	fmt.Fprintln(os.Stdout, "  1. 在主节点机器人的飞书对话中发送 /pair")
 	fmt.Fprintln(os.Stdout, "  2. 将显示的配对码填入下方")
 	fmt.Fprintln(os.Stdout, "")
+
+	fmt.Fprint(os.Stdout, "为本节点取一个名字（如「家里的电脑」「服务器A」）: ")
+	nameLine, _ := reader.ReadString('\n')
+	workerName := strings.TrimSpace(nameLine)
+	if workerName == "" {
+		workerName = "节点-" + randomShortID()
+		fmt.Fprintln(os.Stdout, "未输入名称，自动命名为:", workerName)
+	}
 
 	var mainURL string
 	for {
@@ -90,8 +108,7 @@ func ensurePeerPairing(s *store.Store, reader *bufio.Reader) *config.Config {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 从节点通过 WebSocket 连接主节点，无需暴露端口，selfURL 传空即可
-	resp, err := internalapi.PairWithMain(ctx, mainURL, pairToken, "")
+	resp, err := internalapi.PairWithMain(ctx, mainURL, pairToken, workerName)
 	if err != nil {
 		fmt.Fprintln(os.Stdout, "配对失败:", err)
 		fmt.Fprintln(os.Stdout, "请检查主节点地址和配对码后重新运行。")
@@ -105,8 +122,19 @@ func ensurePeerPairing(s *store.Store, reader *bufio.Reader) *config.Config {
 	_ = s.SetConfig(store.ConfigKeyMode, string(config.ModeWorker))
 	_ = s.SetConfig(store.ConfigKeyInternalToken, resp.WorkerToken)
 	_ = s.SetConfig(store.ConfigKeyMainURL, mainURL)
+	_ = s.SetConfig(store.ConfigKeyWorkerName, workerName)
+	// LLM 配置由主节点下发（配对时获取，连接后通过 WebSocket 同步）
+	if resp.LLMApiKey != "" {
+		_ = s.SetConfig(store.ConfigKeyLLMApiKey, resp.LLMApiKey)
+	}
+	if resp.LLMBaseURL != "" {
+		_ = s.SetConfig(store.ConfigKeyLLMBaseURL, resp.LLMBaseURL)
+	}
+	if resp.LLMModel != "" {
+		_ = s.SetConfig(store.ConfigKeyLLMModel, resp.LLMModel)
+	}
 
-	fmt.Fprintln(os.Stdout, "配对成功！已设为从节点模式，启动后将自动连接主节点。")
+	fmt.Fprintf(os.Stdout, "配对成功！节点「%s」已设为从节点模式，启动后将自动连接主节点并同步配置。\n", workerName)
 	return config.LoadFromStore(s)
 }
 

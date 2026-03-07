@@ -2,6 +2,7 @@ package updater
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,8 +31,13 @@ type Asset struct {
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
-// CheckLatest 获取最新发布版本及当前平台对应的 asset
-func CheckLatest() (version string, assetURL string, err error) {
+// AssetNameForPlatform 返回指定 OS/Arch 的发布包文件名
+func AssetNameForPlatform(osName, arch string) string {
+	return fmt.Sprintf("will-%s-%s.zip", osName, arch)
+}
+
+// CheckLatestForPlatform 获取最新版本中指定平台对应的 asset URL
+func CheckLatestForPlatform(osName, arch string) (version string, assetURL string, err error) {
 	req, _ := http.NewRequest(http.MethodGet, apiLatest, nil)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	resp, err := http.DefaultClient.Do(req)
@@ -47,61 +53,51 @@ func CheckLatest() (version string, assetURL string, err error) {
 		return "", "", err
 	}
 	version = strings.TrimPrefix(rel.TagName, "v")
-	want := assetNameForPlatform()
+	want := AssetNameForPlatform(osName, arch)
 	for _, a := range rel.Assets {
 		if a.Name == want {
 			return version, a.BrowserDownloadURL, nil
 		}
 	}
-	return version, "", fmt.Errorf("未找到当前平台安装包 %s", want)
+	return version, "", fmt.Errorf("未找到平台 %s/%s 的安装包 %s", osName, arch, want)
 }
 
-func assetNameForPlatform() string {
-	osName := runtime.GOOS
-	if osName == "darwin" {
-		osName = "darwin"
+// CheckLatest 获取最新发布版本及当前平台对应的 asset
+func CheckLatest() (version string, assetURL string, err error) {
+	return CheckLatestForPlatform(runtime.GOOS, runtime.GOARCH)
+}
+
+// DownloadZip 下载 assetURL 并返回 zip 原始字节
+func DownloadZip(assetURL string) ([]byte, error) {
+	resp, err := http.Get(assetURL) //nolint:noctx
+	if err != nil {
+		return nil, err
 	}
-	arch := runtime.GOARCH
-	return fmt.Sprintf("will-%s-%s.zip", osName, arch)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
 }
 
-// DownloadAndApply 下载 zip，解压出可执行文件，生成更新脚本并执行后退出
-func DownloadAndApply(assetURL string) error {
+// ApplyFromBytes 从 zip 字节流中提取 will 可执行文件，生成更新脚本后退出进程完成热替换。
+// 用于从节点接收主节点推送的二进制包时直接应用，无需自行访问 GitHub。
+func ApplyFromBytes(zipData []byte) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
 	}
 	dir := filepath.Dir(exePath)
-	zipPath := filepath.Join(dir, "will-update.zip")
 	newExe := filepath.Join(dir, "will.new")
 	if runtime.GOOS == "windows" {
 		newExe = filepath.Join(dir, "will.new.exe")
 	}
 
-	// 下载
-	resp, err := http.Get(assetURL)
+	// 内存解压 zip
+	r, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	f, err := os.Create(zipPath)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(f, resp.Body)
-	f.Close()
-	if err != nil {
-		os.Remove(zipPath)
-		return err
-	}
-	defer os.Remove(zipPath)
-
-	// 解压 zip，找到 will 或 will.exe
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
 	var found bool
 	for _, zf := range r.File {
 		name := filepath.Base(zf.Name)
@@ -134,7 +130,7 @@ func DownloadAndApply(assetURL string) error {
 		return fmt.Errorf("zip 中未找到 will 可执行文件")
 	}
 
-	// 生成更新脚本：等待后替换并重启
+	// 生成更新脚本：等待进程退出后替换并重启
 	if runtime.GOOS == "windows" {
 		bat := filepath.Join(dir, "will-updater.bat")
 		content := fmt.Sprintf("@echo off\r\nping 127.0.0.1 -n 3 >nul\r\nmove /Y \"%s\" \"%s\"\r\nstart \"\" \"%s\"\r\ndel \"%%~f0\"\r\n", newExe, exePath, exePath)
@@ -162,6 +158,15 @@ func DownloadAndApply(assetURL string) error {
 	}
 	os.Exit(0)
 	return nil
+}
+
+// DownloadAndApply 下载 zip 并应用更新（主节点自升级时使用）
+func DownloadAndApply(assetURL string) error {
+	data, err := DownloadZip(assetURL)
+	if err != nil {
+		return err
+	}
+	return ApplyFromBytes(data)
 }
 
 // VersionCheckReply 根据 GitHub 发布检查版本，返回给用户看的文案（不执行 git）
