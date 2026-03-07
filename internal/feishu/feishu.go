@@ -74,19 +74,6 @@ func ReplyMessage(messageID, text string) error {
 	return nil
 }
 
-// IsAllowed 检查 openID 是否在允许列表；列表为空时允许所有人
-func IsAllowed(openID string, allowed []string) bool {
-	if len(allowed) == 0 {
-		return true
-	}
-	for _, id := range allowed {
-		if id == openID {
-			return true
-		}
-	}
-	return false
-}
-
 // InitAndListen 初始化飞书客户端并阻塞监听消息。
 // mode: "ws"（长连接，默认）或 "webhook"（暂未实现）。
 // onMessage(openID, text, messageID) 负责处理消息并自行发送回复。
