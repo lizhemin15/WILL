@@ -718,12 +718,8 @@ func buildConvText(s *store.Store, openID string, n int) string {
 
 func startWorkerHTTP(s *store.Store, cfg *config.Config) {
 	mux := http.NewServeMux()
-	internalapi.RegisterHandler(mux, cfg, func(cmd, workdir string, timeout int) (string, string, string) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
-		defer cancel()
-		res := exec.Run(ctx, cmd, workdir, time.Duration(timeout)*time.Second)
-		return res.Stdout, res.Stderr, res.Error
-	})
+	handler := internalapi.AuthMiddleware(cfg.InternalToken, internalapi.HandleExec)
+	mux.HandleFunc("/internal/exec", handler)
 	addr := cfg.Bind + ":" + cfg.Port
 	log.Printf("[worker] 监听 %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
