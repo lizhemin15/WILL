@@ -445,6 +445,23 @@ func runScheduledTasks(s *store.Store) {
 					s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, payload.OpenID)
 					s.SetConfig(store.ConfigKeyLatestVersion, payload.Version)
 				}
+			case store.KindUserScheduled:
+				var p store.UserScheduledPayload
+				_ = json.Unmarshal([]byte(t.Payload), &p)
+				if p.Instruction == "" || t.OpenID == "" {
+					continue
+				}
+				reply, err := llm.CallForInstruction(cfg, "user:"+t.OpenID, p.Instruction, s)
+				if err != nil {
+					reply = "定时任务执行失败: " + err.Error()
+				}
+				if cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
+					_ = feishu.SendMessageToUser(t.OpenID, "定时任务结果：\n"+reply)
+				}
+				if p.Repeat == "daily" {
+					nextRunAt := t.RunAt + 24*3600
+					_, _ = s.AddUserScheduledTask(t.OpenID, p.Instruction, nextRunAt, "daily")
+				}
 			}
 		}
 	}
@@ -476,39 +493,127 @@ func runWithLLM(s *store.Store, cfg *config.Config, openID string, userMessage s
 			}
 			return fmt.Sprintf("已添加待办 [%d] %s", id, title)
 		case "todo_done":
-			idStr := strings.TrimSpace(resp.TodoID)
-			if idStr == "" {
-				return "请说明要完成哪条待办（编号）。"
-			}
-			id, err := strconv.ParseInt(idStr, 10, 64)
+			list, err := s.ListTodos(openID)
 			if err != nil {
-				return "待办编号需为数字。"
+				return "读取待办失败: " + err.Error()
 			}
-			ok, err := s.SetTodoStatus(id, openID, "done")
-			if err != nil {
-				return "操作失败: " + err.Error()
+			ids, indices, errMsg := parseTodoIndices(strings.TrimSpace(resp.TodoID), list)
+			if errMsg != "" {
+				return errMsg
 			}
-			if !ok {
-				return "未找到该待办或无权操作。"
+			for _, id := range ids {
+				_, _ = s.SetTodoStatus(id, openID, "done")
 			}
-			return fmt.Sprintf("已将 [%d] 标为已完成。", id)
+			return fmt.Sprintf("已将 %s 标为已完成。", formatIndices(indices))
 		case "todo_delete":
-			idStr := strings.TrimSpace(resp.TodoID)
+			list, err := s.ListTodos(openID)
+			if err != nil {
+				return "读取待办失败: " + err.Error()
+			}
+			ids, indices, errMsg := parseTodoIndices(strings.TrimSpace(resp.TodoID), list)
+			if errMsg != "" {
+				return errMsg
+			}
+			for _, id := range ids {
+				_, _ = s.DeleteTodo(id, openID)
+			}
+			return fmt.Sprintf("已删除待办 %s。", formatIndices(indices))
+		case "schedule_list":
+			list, err := s.ListUserScheduledTasks(openID)
+			if err != nil {
+				return "读取定时任务失败: " + err.Error()
+			}
+			return formatScheduleList(list)
+		case "schedule_add":
+			instruction := strings.TrimSpace(resp.ScheduleInstruction)
+			if instruction == "" {
+				return "未识别到任务内容，请说明要定时做什么，如：每天9点先查待办再搜今日科技新闻"
+			}
+			runAt, err := parseScheduleRunAt(strings.TrimSpace(resp.ScheduleRunAt), strings.TrimSpace(strings.ToLower(resp.ScheduleRepeat)))
+			if err != nil {
+				return "时间解析失败，请说明具体时间，如：明天9点、每天09:00 — " + err.Error()
+			}
+			repeat := ""
+			if strings.TrimSpace(strings.ToLower(resp.ScheduleRepeat)) == "daily" {
+				repeat = "daily"
+			}
+			id, err := s.AddUserScheduledTask(openID, instruction, runAt, repeat)
+			if err != nil {
+				return "添加定时任务失败: " + err.Error()
+			}
+			return fmt.Sprintf("已添加定时任务 [%d]，执行时间 %s。", id, time.Unix(runAt, 0).Format("2006-01-02 15:04"))
+		case "schedule_delete":
+			idStr := strings.TrimSpace(resp.ScheduleID)
 			if idStr == "" {
-				return "请说明要删除哪条待办（编号）。"
+				return "请说明要删除哪条定时任务（编号）。"
 			}
 			id, err := strconv.ParseInt(idStr, 10, 64)
 			if err != nil {
-				return "待办编号需为数字。"
+				return "任务编号需为数字。"
 			}
-			ok, err := s.DeleteTodo(id, openID)
+			ok, err := s.DeleteUserScheduledTask(id, openID)
 			if err != nil {
 				return "删除失败: " + err.Error()
 			}
 			if !ok {
-				return "未找到该待办或无权操作。"
+				return "未找到该任务或无权操作。"
 			}
-			return fmt.Sprintf("已删除待办 [%d]。", id)
+			return fmt.Sprintf("已删除定时任务 [%d]。", id)
+		case "schedule_update":
+			idStr := strings.TrimSpace(resp.ScheduleID)
+			if idStr == "" {
+				return "请说明要修改哪条定时任务（编号）。"
+			}
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				return "任务编号需为数字。"
+			}
+			instruction := strings.TrimSpace(resp.ScheduleInstruction)
+			repeat := strings.TrimSpace(strings.ToLower(resp.ScheduleRepeat))
+			runAt := int64(0)
+			if resp.ScheduleRunAt != "" {
+				runAt, err = parseScheduleRunAt(strings.TrimSpace(resp.ScheduleRunAt), repeat)
+				if err != nil {
+					return "时间解析失败: " + err.Error()
+				}
+			}
+			if instruction == "" && runAt == 0 {
+				return "请说明要修改的内容（任务说明或执行时间）。"
+			}
+			list, _ := s.ListUserScheduledTasks(openID)
+			var currentRunAt int64
+			for _, t := range list {
+				if t.ID == id {
+					currentRunAt = t.RunAt
+					break
+				}
+			}
+			if runAt == 0 {
+				runAt = currentRunAt
+			}
+			rep := ""
+			if repeat == "daily" {
+				rep = "daily"
+			}
+			for _, t := range list {
+				if t.ID == id {
+					if instruction == "" {
+						instruction = t.Instruction
+					}
+					if rep == "" {
+						rep = t.Repeat
+					}
+					break
+				}
+			}
+			ok, err := s.UpdateUserScheduledTask(id, openID, instruction, runAt, rep)
+			if err != nil {
+				return "更新失败: " + err.Error()
+			}
+			if !ok {
+				return "未找到该任务或无权操作。"
+			}
+			return fmt.Sprintf("已更新定时任务 [%d]。", id)
 		case "version_check":
 			reply := updater.VersionCheckReply(Version)
 			if strings.Contains(reply, "发现新版本") {
@@ -542,15 +647,103 @@ func formatTodoList(list []store.Todo) string {
 	}
 	var b strings.Builder
 	b.WriteString("待办列表：\n")
-	for _, t := range list {
+	for i, t := range list {
 		status := "未完成"
 		if t.Status == "done" {
 			status = "已完成"
 		}
-		b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", t.ID, t.Title, status))
+		b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", i+1, t.Title, status))
 	}
-	b.WriteString("\n说「完成第1条」或「删除待办2」；或发 /todo done <id> / /todo delete <id>")
+	b.WriteString("\n说「完成1」或「删除待办1、2」；序号从 1 开始，可多个用逗号分隔")
 	return b.String()
+}
+
+// parseTodoIndices 解析 todo_id 字符串（如 "1,2,3" 或 "1 2"）为实际 id 列表；list 为当前待办列表，序号从 1 开始。返回 (ids, 用于回复的序号文案, 错误信息)
+func parseTodoIndices(todoIDStr string, list []store.Todo) (ids []int64, indices []int, errMsg string) {
+	if todoIDStr == "" {
+		return nil, nil, "请说明要操作哪条待办（序号 1、2、3…，多条用逗号分隔如 1,2）。"
+	}
+	parts := strings.FieldsFunc(todoIDStr, func(r rune) bool { return r == ',' || r == '，' || r == ' ' || r == '、' })
+	seen := make(map[int]bool)
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 {
+			return nil, nil, "待办序号需为正整数（1、2、3…）。"
+		}
+		if n > len(list) {
+			return nil, nil, fmt.Sprintf("当前只有 %d 条待办，没有序号 %d。", len(list), n)
+		}
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		ids = append(ids, list[n-1].ID)
+		indices = append(indices, n)
+	}
+	if len(ids) == 0 {
+		return nil, nil, "未识别到有效序号，请说如：删除1、2 或 完成1。"
+	}
+	return ids, indices, ""
+}
+
+func formatIndices(indices []int) string {
+	if len(indices) == 0 {
+		return ""
+	}
+	if len(indices) == 1 {
+		return fmt.Sprintf("%d", indices[0])
+	}
+	return strings.Trim(strings.Replace(fmt.Sprint(indices), " ", "、", -1), "[]")
+}
+
+func formatScheduleList(list []store.UserScheduledTask) string {
+	if len(list) == 0 {
+		return "当前无定时任务。说「添加定时任务：每天9点查待办」等即可添加。"
+	}
+	var b strings.Builder
+	b.WriteString("定时任务列表：\n")
+	for _, t := range list {
+		when := time.Unix(t.RunAt, 0).Format("2006-01-02 15:04")
+		if t.Repeat == "daily" {
+			when = "每天 " + time.Unix(t.RunAt, 0).Format("15:04")
+		}
+		b.WriteString(fmt.Sprintf("[%d] %s — %s\n", t.ID, when, t.Instruction))
+	}
+	b.WriteString("\n说「删除定时任务 1」或「修改定时任务 2 改为每天10点」")
+	return b.String()
+}
+
+// parseScheduleRunAt 解析执行时间：runAt 为 ISO 如 2006-01-02T15:04:05 或每日时间 09:00；repeat 为 "daily" 或空
+func parseScheduleRunAt(runAt, repeat string) (int64, error) {
+	now := time.Now()
+	if repeat == "daily" {
+		// 解析 09:00 或 9:00
+		for _, layout := range []string{"15:04", "15:4", "1:04", "1:4"} {
+			t, err := time.ParseInLocation(layout, runAt, now.Location())
+			if err != nil {
+				continue
+			}
+			next := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
+			if next.Before(now) || next.Equal(now) {
+				next = next.Add(24 * time.Hour)
+			}
+			return next.Unix(), nil
+		}
+		return 0, fmt.Errorf("每日时间格式应为 09:00 或 9:00")
+	}
+	// 单次：ISO
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04"} {
+		t, err := time.ParseInLocation(layout, runAt, now.Location())
+		if err != nil {
+			continue
+		}
+		return t.Unix(), nil
+	}
+	return 0, fmt.Errorf("时间格式应为 2006-01-02T09:00:00 或 2006-01-02 09:00")
 }
 
 func runTask(cfg *config.Config, instruction string) string {

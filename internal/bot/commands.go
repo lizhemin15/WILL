@@ -219,7 +219,7 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 	if openID == "" {
 		return "无法获取你的 open_id。"
 	}
-	// /todo 或 /todo list：列出待办
+	// /todo 或 /todo list：列出待办（序号从 1 开始）
 	if len(args) == 0 || (len(args) >= 1 && strings.ToLower(strings.TrimSpace(args[0])) == "list") {
 		list, err := s.ListTodos(openID)
 		if err != nil {
@@ -230,14 +230,14 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		}
 		var b strings.Builder
 		b.WriteString("待办列表：\n")
-		for _, t := range list {
+		for i, t := range list {
 			status := "未完成"
 			if t.Status == "done" {
 				status = "已完成"
 			}
-			b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", t.ID, t.Title, status))
+			b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", i+1, t.Title, status))
 		}
-		b.WriteString("\n/todo done <id> 标为已完成  /todo delete <id> 删除")
+		b.WriteString("\n/todo done 1 2 或 /todo delete 1,2 可一次操作多条")
 		return b.String()
 	}
 	sub := strings.ToLower(strings.TrimSpace(args[0]))
@@ -257,37 +257,65 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		return fmt.Sprintf("已添加待办 [%d] %s", id, title)
 	case "done":
 		if len(args) < 2 {
-			return "用法: /todo done <id>"
+			return "用法: /todo done <序号> 或 /todo done 1 2 3"
 		}
-		id, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
+		list, err := s.ListTodos(openID)
 		if err != nil {
-			return "id 需为数字。"
+			return "读取待办失败: " + err.Error()
 		}
-		ok, err := s.SetTodoStatus(id, openID, "done")
-		if err != nil {
-			return "操作失败: " + err.Error()
+		ids, indices := resolveTodoIndices(list, args[1:])
+		if len(ids) == 0 {
+			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-		if !ok {
-			return "未找到该待办或无权操作。"
+		for _, id := range ids {
+			_, _ = s.SetTodoStatus(id, openID, "done")
 		}
-		return fmt.Sprintf("已将 [%d] 标为已完成。", id)
+		return fmt.Sprintf("已将 %s 标为已完成。", formatTodoIndices(indices))
 	case "delete":
 		if len(args) < 2 {
-			return "用法: /todo delete <id>"
+			return "用法: /todo delete <序号> 或 /todo delete 1 2 3"
 		}
-		id, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
+		list, err := s.ListTodos(openID)
 		if err != nil {
-			return "id 需为数字。"
+			return "读取待办失败: " + err.Error()
 		}
-		ok, err := s.DeleteTodo(id, openID)
-		if err != nil {
-			return "删除失败: " + err.Error()
+		ids, indices := resolveTodoIndices(list, args[1:])
+		if len(ids) == 0 {
+			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-		if !ok {
-			return "未找到该待办或无权操作。"
+		for _, id := range ids {
+			_, _ = s.DeleteTodo(id, openID)
 		}
-		return fmt.Sprintf("已删除待办 [%d]。", id)
+		return fmt.Sprintf("已删除待办 %s。", formatTodoIndices(indices))
 	default:
-		return "用法: /todo [list|add <内容>|done <id>|delete <id>]"
+		return "用法: /todo [list|add <内容>|done 1 2|delete 1 2]"
 	}
+}
+
+// resolveTodoIndices 将参数（如 ["1", "2"] 或 ["1,2,3"]）解析为待办 id 与序号；list 为当前列表，序号从 1 开始
+func resolveTodoIndices(list []store.Todo, args []string) (ids []int64, indices []int) {
+	seen := make(map[int]bool)
+	for _, a := range args {
+		for _, p := range strings.FieldsFunc(a, func(r rune) bool { return r == ',' || r == '，' || r == '、' }) {
+			p = strings.TrimSpace(p)
+			n, err := strconv.Atoi(p)
+			if err != nil || n < 1 || n > len(list) || seen[n] {
+				continue
+			}
+			seen[n] = true
+			ids = append(ids, list[n-1].ID)
+			indices = append(indices, n)
+		}
+	}
+	return ids, indices
+}
+
+func formatTodoIndices(indices []int) string {
+	if len(indices) == 0 {
+		return ""
+	}
+	if len(indices) == 1 {
+		return strconv.Itoa(indices[0])
+	}
+	return strings.Trim(strings.Replace(fmt.Sprint(indices), " ", "、", -1), "[]")
 }

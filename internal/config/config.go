@@ -20,9 +20,10 @@ type Config struct {
 	Bind string
 	Port string
 
-	LLMApiKey  string
-	LLMBaseURL string
-	LLMModel   string
+	LLMApiKey       string
+	LLMBaseURL      string
+	LLMModel        string
+	LLMSearchModel  string // 涉及搜索最新信息时使用，默认 gpt-5-search-api
 
 	FeishuAppID     string
 	FeishuAppSecret string
@@ -102,6 +103,7 @@ func loadFrom(s *store.Store) *Config {
 		LLMApiKey:       get("OPENAI_API_KEY", store.ConfigKeyLLMApiKey, ""),
 		LLMBaseURL:      get("OPENAI_BASE_URL", store.ConfigKeyLLMBaseURL, "https://api.openai.com/v1"),
 		LLMModel:        get("OPENAI_MODEL", store.ConfigKeyLLMModel, "gpt-4o-mini"),
+		LLMSearchModel:  get("OPENAI_SEARCH_MODEL", store.ConfigKeyLLMSearchModel, "gpt-5-search-api"),
 		FeishuAppID:     get("FEISHU_APP_ID", store.ConfigKeyFeishuAppID, ""),
 		FeishuAppSecret: get("FEISHU_APP_SECRET", store.ConfigKeyFeishuAppSecret, ""),
 		FeishuAllowed:   allowed,

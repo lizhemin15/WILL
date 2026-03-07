@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ const (
 	ConfigKeyLLMApiKey        = "llm_api_key"
 	ConfigKeyLLMBaseURL       = "llm_base_url"
 	ConfigKeyLLMModel         = "llm_model"
+	ConfigKeyLLMSearchModel   = "llm_search_model" // 涉及搜索最新信息时临时切换的模型
 	ConfigKeyFeishuAppID      = "feishu_app_id"
 	ConfigKeyFeishuAppSecret  = "feishu_app_secret"
 	ConfigKeyAllowedOpenIDs   = "allowed_open_ids"
@@ -103,7 +105,11 @@ func (s *Store) migrate() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_conversation_open_id ON conversation(open_id);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	_, _ = s.db.Exec("ALTER TABLE scheduled_tasks ADD COLUMN open_id TEXT")
+	return nil
 }
 
 func (s *Store) GetConfig(key string) (string, bool) {
@@ -207,22 +213,30 @@ func (s *Store) AddScheduledTask(kind, payload string, runAt int64) (int64, erro
 	return id, nil
 }
 
-func (s *Store) ListScheduledTasksDue(now int64) ([]struct{ ID int64; Kind, Payload string }, error) {
+// ScheduledTaskDue 到期任务（含 open_id、run_at 供 user_scheduled 使用）
+type ScheduledTaskDue struct {
+	ID      int64
+	Kind    string
+	Payload string
+	OpenID  string
+	RunAt   int64
+}
+
+func (s *Store) ListScheduledTasksDue(now int64) ([]ScheduledTaskDue, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query("SELECT id, kind, payload FROM scheduled_tasks WHERE run_at <= ? ORDER BY run_at", now)
+	rows, err := s.db.Query("SELECT id, kind, payload, COALESCE(open_id,''), run_at FROM scheduled_tasks WHERE run_at <= ? ORDER BY run_at", now)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []struct{ ID int64; Kind, Payload string }
+	var out []ScheduledTaskDue
 	for rows.Next() {
-		var id int64
-		var kind, payload string
-		if err := rows.Scan(&id, &kind, &payload); err != nil {
+		var t ScheduledTaskDue
+		if err := rows.Scan(&t.ID, &t.Kind, &t.Payload, &t.OpenID, &t.RunAt); err != nil {
 			return nil, err
 		}
-		out = append(out, struct{ ID int64; Kind, Payload string }{id, kind, payload})
+		out = append(out, t)
 	}
 	return out, rows.Err()
 }
@@ -232,6 +246,94 @@ func (s *Store) DeleteScheduledTask(id int64) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("DELETE FROM scheduled_tasks WHERE id = ?", id)
 	return err
+}
+
+// UserScheduledPayload 用户定时任务 payload
+type UserScheduledPayload struct {
+	Instruction string `json:"instruction"`
+	Repeat     string `json:"repeat"` // "daily" | ""
+}
+
+const KindUserScheduled = "user_scheduled"
+
+// AddUserScheduledTask 添加用户定时任务，返回任务 id
+func (s *Store) AddUserScheduledTask(openID, instruction string, runAt int64, repeat string) (int64, error) {
+	payload := UserScheduledPayload{Instruction: instruction, Repeat: repeat}
+	payloadBytes, _ := json.Marshal(payload)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"INSERT INTO scheduled_tasks (kind, payload, run_at, created_at, open_id) VALUES (?, ?, ?, ?, ?)",
+		KindUserScheduled, string(payloadBytes), runAt, time.Now().Unix(), openID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	id, _ := res.LastInsertId()
+	return id, nil
+}
+
+// UserScheduledTask 用户定时任务列表项
+type UserScheduledTask struct {
+	ID          int64
+	Instruction string
+	Repeat      string
+	RunAt       int64
+}
+
+func (s *Store) ListUserScheduledTasks(openID string) ([]UserScheduledTask, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(
+		"SELECT id, payload, run_at FROM scheduled_tasks WHERE kind = ? AND open_id = ? ORDER BY run_at",
+		KindUserScheduled, openID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserScheduledTask
+	for rows.Next() {
+		var id int64
+		var payload string
+		var runAt int64
+		if err := rows.Scan(&id, &payload, &runAt); err != nil {
+			return nil, err
+		}
+		var p UserScheduledPayload
+		_ = json.Unmarshal([]byte(payload), &p)
+		out = append(out, UserScheduledTask{ID: id, Instruction: p.Instruction, Repeat: p.Repeat, RunAt: runAt})
+	}
+	return out, rows.Err()
+}
+
+// DeleteUserScheduledTask 删除用户定时任务（仅限本人）
+func (s *Store) DeleteUserScheduledTask(id int64, openID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec("DELETE FROM scheduled_tasks WHERE id = ? AND kind = ? AND open_id = ?", id, KindUserScheduled, openID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// UpdateUserScheduledTask 更新用户定时任务（instruction / run_at / repeat）
+func (s *Store) UpdateUserScheduledTask(id int64, openID string, instruction string, runAt int64, repeat string) (bool, error) {
+	payload := UserScheduledPayload{Instruction: instruction, Repeat: repeat}
+	payloadBytes, _ := json.Marshal(payload)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"UPDATE scheduled_tasks SET payload = ?, run_at = ? WHERE id = ? AND kind = ? AND open_id = ?",
+		string(payloadBytes), runAt, id, KindUserScheduled, openID,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // Todo 待办项
