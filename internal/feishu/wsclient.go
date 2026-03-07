@@ -42,11 +42,11 @@ func StartWSClient(appID, appSecret string, onMessage ProcessMessageFunc) {
 					} else {
 						log.Printf("[feishu] 已发消息给 open_id=%q", openID)
 					}
-				} else if sendReply && reply != "" {
-					_ = ReplyMessage(messageID, reply)
-				} else {
-					log.Printf("[feishu] 本条不回复 sendReply=%v reply_empty=%v", sendReply, reply == "")
-				}
+			} else if sendReply && reply != "" {
+				_ = ReplyMessage(messageID, reply)
+			} else if sendReply {
+				log.Printf("[feishu] sendReply=true 但 reply 为空，跳过")
+			}
 			}()
 			return nil
 		})

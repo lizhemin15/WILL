@@ -104,8 +104,6 @@ func main() {
 }
 
 func processFeishuMessage(s *store.Store, cfg *config.Config, openID, text, messageID string) (reply string, sendReply bool) {
-	log.Printf("[feishu] 处理文本: %q", text)
-
 	// 首次用户：自动授权
 	if len(cfg.FeishuAllowed) == 0 {
 		_ = s.AddAllowedOpenID(openID)
