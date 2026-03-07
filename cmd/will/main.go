@@ -206,12 +206,15 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 			return "添加失败: " + err.Error()
 		}
 		// 同步到飞书任务中心
+		syncNote := "（飞书同步失败，请确认应用已开启 task:task 权限）"
 		if taskID, ferr := feishu.CreateTask(openID, title); ferr == nil && taskID != "" {
 			_ = s.SetFeishuTaskID(localID, taskID)
+			syncNote = "（已同步至飞书任务中心）"
 		} else if ferr != nil {
-			log.Printf("[todo] 创建飞书任务失败（本地已保存）: %v", ferr)
+			log.Printf("[todo] 创建飞书任务失败: %v", ferr)
+			syncNote = fmt.Sprintf("（飞书同步失败: %v）", ferr)
 		}
-		return fmt.Sprintf("已添加待办 [%d] %s（已同步至飞书任务）", localID, title)
+		return fmt.Sprintf("已添加待办 [%d] %s %s", localID, title, syncNote)
 
 	case "todo_done", "todo_delete":
 		var p struct{ Indices string `json:"indices"` }

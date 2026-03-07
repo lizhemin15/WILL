@@ -266,12 +266,15 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if err != nil {
 			return "添加失败: " + err.Error()
 		}
+		syncNote := "（飞书同步失败，请确认应用已开启 task:task 权限）"
 		if taskID, ferr := feishu.CreateTask(openID, title); ferr == nil && taskID != "" {
 			_ = s.SetFeishuTaskID(localID, taskID)
+			syncNote = "（已同步至飞书任务中心）"
 		} else if ferr != nil {
-			log.Printf("[todo] 创建飞书任务失败（本地已保存）: %v", ferr)
+			log.Printf("[todo] 创建飞书任务失败: %v", ferr)
+			syncNote = fmt.Sprintf("（飞书同步失败: %v）", ferr)
 		}
-		return fmt.Sprintf("已添加待办 [%d] %s（已同步至飞书任务）", localID, title)
+		return fmt.Sprintf("已添加待办 [%d] %s %s", localID, title, syncNote)
 	case "done":
 		if len(args) < 2 {
 			return "用法: /todo done <序号> 或 /todo done 1 2 3"
