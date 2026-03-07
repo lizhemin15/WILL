@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -261,43 +262,7 @@ func processFeishuMessage(s *store.Store, openID, messageID, text string) (reply
 	if rpl, ok := bot.HandleCommand(text, openID, s, cfg); ok {
 		return rpl, true
 	}
-	// 用户说「检查新版本」等时走 GitHub 版本号检查，不执行 LLM 解析出的 git 命令
-	if isVersionCheckRequest(text) {
-		reply := updater.VersionCheckReply(Version)
-		if s != nil && strings.Contains(reply, "发现新版本") {
-			latestVer, _, _ := updater.CheckLatest()
-			if latestVer != "" {
-				s.SetConfig(store.ConfigKeyLatestVersion, latestVer)
-				s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
-				s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, openID)
-			}
-		}
-		return reply, true
-	}
 	return runWithLLM(s, cfg, openID, text), true
-}
-
-func isVersionCheckRequest(text string) bool {
-	t := strings.TrimSpace(text)
-	if t == "" {
-		return false
-	}
-	lower := strings.ToLower(t)
-	keywords := []string{
-		"检查新版本", "检查更新", "有没有新版本", "查版本", "检查版本", "更新检查",
-		"查更新", "看看有没有更新", "有没有更新", "新版本", "检查一下版本",
-		"/version", "version",
-	}
-	for _, k := range keywords {
-		if lower == k || strings.Contains(lower, k) {
-			return true
-		}
-	}
-	// 纯「更新」「版本」等短句也视为查版本
-	if len(t) <= 6 && (strings.Contains(lower, "更新") || strings.Contains(lower, "版本")) {
-		return true
-	}
-	return false
 }
 
 const updatePromptMaxAge = 24 * time.Hour
@@ -428,11 +393,77 @@ func runScheduledTasks(s *store.Store) {
 	}
 }
 
-// runWithLLM 用 LLM 解析用户意图，写入 config/memory，执行 command，再回复
+// runWithLLM 用 LLM 解析用户意图，再按 intent 分发或执行 command/回复
 func runWithLLM(s *store.Store, cfg *config.Config, openID string, userMessage string) string {
 	resp, err := llm.Call(cfg, "user:"+openID, userMessage)
 	if err != nil {
 		return "LLM 调用失败 — " + err.Error()
+	}
+	intent := strings.TrimSpace(strings.ToLower(resp.Intent))
+	if s != nil && openID != "" {
+		switch intent {
+		case "todo_list":
+			list, err := s.ListTodos(openID)
+			if err != nil {
+				return "读取待办失败: " + err.Error()
+			}
+			return formatTodoList(list)
+		case "todo_add":
+			title := strings.TrimSpace(resp.TodoTitle)
+			if title == "" {
+				return "未识别到待办内容，请说明要添加什么，如：帮我加个待办买牛奶"
+			}
+			id, err := s.AddTodo(openID, title)
+			if err != nil {
+				return "添加失败: " + err.Error()
+			}
+			return fmt.Sprintf("已添加待办 [%d] %s", id, title)
+		case "todo_done":
+			idStr := strings.TrimSpace(resp.TodoID)
+			if idStr == "" {
+				return "请说明要完成哪条待办（编号）。"
+			}
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				return "待办编号需为数字。"
+			}
+			ok, err := s.SetTodoStatus(id, openID, "done")
+			if err != nil {
+				return "操作失败: " + err.Error()
+			}
+			if !ok {
+				return "未找到该待办或无权操作。"
+			}
+			return fmt.Sprintf("已将 [%d] 标为已完成。", id)
+		case "todo_delete":
+			idStr := strings.TrimSpace(resp.TodoID)
+			if idStr == "" {
+				return "请说明要删除哪条待办（编号）。"
+			}
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				return "待办编号需为数字。"
+			}
+			ok, err := s.DeleteTodo(id, openID)
+			if err != nil {
+				return "删除失败: " + err.Error()
+			}
+			if !ok {
+				return "未找到该待办或无权操作。"
+			}
+			return fmt.Sprintf("已删除待办 [%d]。", id)
+		case "version_check":
+			reply := updater.VersionCheckReply(Version)
+			if strings.Contains(reply, "发现新版本") {
+				latestVer, _, _ := updater.CheckLatest()
+				if latestVer != "" {
+					s.SetConfig(store.ConfigKeyLatestVersion, latestVer)
+					s.SetConfig(store.ConfigKeyUpdatePromptAt, strconv.FormatInt(time.Now().Unix(), 10))
+					s.SetConfig(store.ConfigKeyUpdateNotifyOpenID, openID)
+				}
+			}
+			return reply
+		}
 	}
 	command, replyText := llm.Apply(s, openID, resp)
 	if command != "" {
@@ -446,6 +477,23 @@ func runWithLLM(s *store.Store, cfg *config.Config, openID string, userMessage s
 		return replyText
 	}
 	return "已处理。"
+}
+
+func formatTodoList(list []store.Todo) string {
+	if len(list) == 0 {
+		return "当前无待办。说「添加待办 xxx」或发 /todo add xxx 添加。"
+	}
+	var b strings.Builder
+	b.WriteString("待办列表：\n")
+	for _, t := range list {
+		status := "未完成"
+		if t.Status == "done" {
+			status = "已完成"
+		}
+		b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", t.ID, t.Title, status))
+	}
+	b.WriteString("\n说「完成第1条」或「删除待办2」；或发 /todo done <id> / /todo delete <id>")
+	return b.String()
 }
 
 func runTask(cfg *config.Config, instruction string) string {

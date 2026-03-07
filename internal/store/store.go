@@ -85,6 +85,14 @@ func (s *Store) migrate() error {
 			created_at INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_run_at ON scheduled_tasks(run_at);
+		CREATE TABLE IF NOT EXISTS todos (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			open_id TEXT NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_todos_open_id ON todos(open_id);
 	`)
 	return err
 }
@@ -215,4 +223,78 @@ func (s *Store) DeleteScheduledTask(id int64) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("DELETE FROM scheduled_tasks WHERE id = ?", id)
 	return err
+}
+
+// Todo 待办项
+type Todo struct {
+	ID        int64
+	OpenID    string
+	Title     string
+	Status    string // "pending" | "done"
+	CreatedAt int64
+}
+
+func (s *Store) AddTodo(openID, title string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return 0, nil
+	}
+	res, err := s.db.Exec(
+		"INSERT INTO todos (open_id, title, status, created_at) VALUES (?, ?, 'pending', ?)",
+		openID, title, time.Now().Unix(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	id, _ := res.LastInsertId()
+	return id, nil
+}
+
+func (s *Store) ListTodos(openID string) ([]Todo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(
+		"SELECT id, open_id, title, status, created_at FROM todos WHERE open_id = ? ORDER BY status ASC, id ASC",
+		openID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Todo
+	for rows.Next() {
+		var t Todo
+		if err := rows.Scan(&t.ID, &t.OpenID, &t.Title, &t.Status, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SetTodoStatus(id int64, openID, status string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"UPDATE todos SET status = ? WHERE id = ? AND open_id = ?",
+		status, id, openID,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) DeleteTodo(id int64, openID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec("DELETE FROM todos WHERE id = ? AND open_id = ?", id, openID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }

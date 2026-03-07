@@ -25,12 +25,15 @@ var AllowedConfigKeys = map[string]string{
 	"llm_model":         store.ConfigKeyLLMModel,
 }
 
-// Response 期望 LLM 返回的 JSON 结构
+// Response 期望 LLM 返回的 JSON 结构；先由 intent 判定意图再分发
 type Response struct {
-	Config  map[string]string `json:"config"`
-	Memory  map[string]string `json:"memory"`
-	Command string            `json:"command"`
-	Reply   string            `json:"reply"`
+	Intent    string            `json:"intent"`     // todo_list / todo_add / todo_done / todo_delete / version_check / 空或 chat 等
+	TodoTitle string            `json:"todo_title"` // todo_add 时填待办内容
+	TodoID    string            `json:"todo_id"`   // todo_done / todo_delete 时填待办 id（数字字符串）
+	Config    map[string]string `json:"config"`
+	Memory    map[string]string `json:"memory"`
+	Command   string            `json:"command"`
+	Reply     string            `json:"reply"`
 }
 
 // TestConfig 校验 LLM 配置是否可用（发一次最小 completion 请求）
@@ -84,10 +87,20 @@ func Call(cfg *config.Config, userScope string, userMessage string) (Response, e
 		model = "gpt-4o-mini"
 	}
 
-	sys := `你是 WILL 的助手。用户可能要求：1) 保存配置（飞书 app_id、app_secret、mode、worker_urls 等）；2) 记录或读取记忆；3) 执行系统命令；4) 普通对话。
-你必须用纯 JSON 回复，且只包含一个 JSON 对象，不要其他文字。格式：
-{"config": {"key": "value", ...}, "memory": {"key": "value", ...}, "command": "要执行的 shell 命令，若无则空字符串", "reply": "给用户的简短回复"}
-说明：config 的 key 仅限：feishu_app_id, feishu_app_secret, mode, internal_token, worker_urls, port, bind, llm_api_key, llm_base_url, llm_model。memory 会按用户维度存储。若用户只是闲聊或无需执行/保存，command 和 config/memory 可为空。`
+	sys := `你是 WILL 的助手。请先根据用户消息判断意图，再填对应字段。必须用纯 JSON 回复，只包含一个 JSON 对象，不要其他文字。
+
+意图 intent 取值（只能填其中一个，否则留空）：
+- todo_list：用户要查看待办列表（如「我的待办」「看看待办」「有什么待办」）
+- todo_add：用户要添加待办，此时必填 todo_title（待办内容）
+- todo_done：用户要把某条待办标为已完成，此时必填 todo_id（待办编号数字字符串，如 "1"）
+- todo_delete：用户要删除某条待办，此时必填 todo_id
+- version_check：用户要检查程序是否有新版本（如「检查更新」「有没有新版本」「查版本」）
+- 留空或 chat：其他情况（执行命令、改配置、记记忆、普通对话）
+
+JSON 格式（未用到的字段填空字符串或空对象）：
+{"intent": "上述之一或空", "todo_title": "", "todo_id": "", "config": {}, "memory": {}, "command": "要执行的 shell 命令，若无则空", "reply": "给用户的简短回复"}
+
+说明：config 的 key 仅限 feishu_app_id, feishu_app_secret, mode, internal_token, worker_urls, port, bind, llm_api_key, llm_base_url, llm_model。不要用 git 检查版本，用户说检查更新时 intent 填 version_check 即可。`
 
 	body := map[string]interface{}{
 		"model": model,

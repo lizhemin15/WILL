@@ -1,11 +1,37 @@
 package bot
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/yourusername/will/internal/config"
 	"github.com/yourusername/will/internal/store"
 )
+
+// HandleTodoNaturalLanguage 处理「待办列表」「添加待办 xxx」等自然语言，返回回复及是否已处理
+func HandleTodoNaturalLanguage(text string, openID string, s *store.Store) (reply string, handled bool) {
+	if s == nil || openID == "" {
+		return "", false
+	}
+	t := strings.TrimSpace(text)
+	lower := strings.ToLower(t)
+	if lower == "待办" || lower == "待办列表" || lower == "我的待办" || lower == "看看待办" {
+		return cmdTodo([]string{"list"}, openID, s), true
+	}
+	if strings.HasPrefix(lower, "添加待办") || strings.HasPrefix(lower, "待办添加") {
+		prefix := "添加待办"
+		if strings.HasPrefix(lower, "待办添加") {
+			prefix = "待办添加"
+		}
+		title := strings.TrimSpace(t[len(prefix):])
+		if title == "" {
+			return "添加待办请说明内容，如：添加待办 买牛奶", true
+		}
+		return cmdTodo([]string{"add", title}, openID, s), true
+	}
+	return "", false
+}
 
 // HandleCommand 处理 / 开头的配置与记忆命令，返回回复文案；若不是命令或未处理则返回空字符串。
 func HandleCommand(text string, openID string, s *store.Store, cfg *config.Config) (reply string, handled bool) {
@@ -22,6 +48,9 @@ func HandleCommand(text string, openID string, s *store.Store, cfg *config.Confi
 		if cmd == "config" {
 			return cmdConfigGet(s, cfg), true
 		}
+		if cmd == "todo" {
+			return cmdTodo(nil, openID, s), true
+		}
 		return "用法: /help", true
 	}
 	args := parts[1:]
@@ -32,6 +61,8 @@ func HandleCommand(text string, openID string, s *store.Store, cfg *config.Confi
 		return cmdConfig(args, s, cfg), true
 	case "memory":
 		return cmdMemory(args, openID, s), true
+	case "todo":
+		return cmdTodo(args, openID, s), true
 	default:
 		return "", false
 	}
@@ -45,6 +76,10 @@ func cmdHelp() string {
 /memory set <k> <v> — 记录记忆
 /memory get <k>     — 读取记忆
 /memory list       — 列出当前 scope 的记忆
+/todo              — 待办列表
+/todo add <内容>   — 添加待办
+/todo done <id>    — 标为已完成
+/todo delete <id>  — 删除待办
 自然语言也可：直接说「把飞书 app id 设为 xxx」或「执行 ls」，由 LLM 解析后写入配置或执行命令。`
 }
 
@@ -174,5 +209,85 @@ func cmdMemory(args []string, openID string, s *store.Store) string {
 		return out
 	default:
 		return "用法: /memory set|get|list ..."
+	}
+}
+
+func cmdTodo(args []string, openID string, s *store.Store) string {
+	if s == nil {
+		return "未启用本地存储，无法使用待办。"
+	}
+	if openID == "" {
+		return "无法获取你的 open_id。"
+	}
+	// /todo 或 /todo list：列出待办
+	if len(args) == 0 || (len(args) >= 1 && strings.ToLower(strings.TrimSpace(args[0])) == "list") {
+		list, err := s.ListTodos(openID)
+		if err != nil {
+			return "读取待办失败: " + err.Error()
+		}
+		if len(list) == 0 {
+			return "当前无待办。发送 /todo add <内容> 添加。"
+		}
+		var b strings.Builder
+		b.WriteString("待办列表：\n")
+		for _, t := range list {
+			status := "未完成"
+			if t.Status == "done" {
+				status = "已完成"
+			}
+			b.WriteString(fmt.Sprintf("[%d] %s (%s)\n", t.ID, t.Title, status))
+		}
+		b.WriteString("\n/todo done <id> 标为已完成  /todo delete <id> 删除")
+		return b.String()
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	switch sub {
+	case "add":
+		if len(args) < 2 {
+			return "用法: /todo add <内容>"
+		}
+		title := strings.TrimSpace(strings.Join(args[1:], " "))
+		if title == "" {
+			return "待办内容不能为空。"
+		}
+		id, err := s.AddTodo(openID, title)
+		if err != nil {
+			return "添加失败: " + err.Error()
+		}
+		return fmt.Sprintf("已添加待办 [%d] %s", id, title)
+	case "done":
+		if len(args) < 2 {
+			return "用法: /todo done <id>"
+		}
+		id, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
+		if err != nil {
+			return "id 需为数字。"
+		}
+		ok, err := s.SetTodoStatus(id, openID, "done")
+		if err != nil {
+			return "操作失败: " + err.Error()
+		}
+		if !ok {
+			return "未找到该待办或无权操作。"
+		}
+		return fmt.Sprintf("已将 [%d] 标为已完成。", id)
+	case "delete":
+		if len(args) < 2 {
+			return "用法: /todo delete <id>"
+		}
+		id, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64)
+		if err != nil {
+			return "id 需为数字。"
+		}
+		ok, err := s.DeleteTodo(id, openID)
+		if err != nil {
+			return "删除失败: " + err.Error()
+		}
+		if !ok {
+			return "未找到该待办或无权操作。"
+		}
+		return fmt.Sprintf("已删除待办 [%d]。", id)
+	default:
+		return "用法: /todo [list|add <内容>|done <id>|delete <id>]"
 	}
 }
