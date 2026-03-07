@@ -71,8 +71,7 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func defaultDBPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".will", "will.db")
+	return "will.db"
 }
 
 func (s *Store) migrate() error {

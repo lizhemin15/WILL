@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,7 +60,8 @@ func markSeen(id string) bool {
 var Version = "dev"
 
 func main() {
-	s, err := store.Open("")
+	dbPath := os.Getenv("WILL_DB") // 可选，如 /opt/will/will.db；空则用 ~/.will/will.db
+	s, err := store.Open(dbPath)
 	if err != nil {
 		log.Fatalf("打开数据库失败: %v", err)
 	}
