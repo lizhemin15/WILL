@@ -17,6 +17,7 @@ import (
 	"github.com/yourusername/will/internal/feishu"
 	"github.com/yourusername/will/internal/internalapi"
 	"github.com/yourusername/will/internal/llm"
+	"github.com/yourusername/will/internal/orchestrator"
 	"github.com/yourusername/will/internal/setup"
 	"github.com/yourusername/will/internal/store"
 	"github.com/yourusername/will/internal/updater"
@@ -282,7 +283,7 @@ func processFeishuMessage(s *store.Store, openID, messageID, text string) (reply
 		reply, sendReply = rpl, true
 		goto done
 	}
-	reply, sendReply = runWithLLM(s, cfg, openID, text), true
+	reply, sendReply = runMultiAgent(s, cfg, openID, text), true
 done:
 	if sendReply && s != nil && openID != "" && reply != "" {
 		_ = s.AppendConversation(openID, "user", text)
@@ -467,7 +468,15 @@ func runScheduledTasks(s *store.Store) {
 	}
 }
 
-// runWithLLM 用 LLM 解析用户意图，再按 intent 分发或执行 command/回复
+// runMultiAgent 多智能体：先规划拆解任务，有依赖的按序执行、无依赖的并行，最后审查并可返工
+func runMultiAgent(s *store.Store, cfg *config.Config, openID string, userMessage string) string {
+	runStep := func(step string) string {
+		return runWithLLM(s, cfg, openID, step)
+	}
+	return orchestrator.Run(cfg, userMessage, runStep)
+}
+
+// runWithLLM 用 LLM 解析用户意图，再按 intent 分发或执行 command/回复（单步，供多智能体调用）
 func runWithLLM(s *store.Store, cfg *config.Config, openID string, userMessage string) string {
 	resp, err := llm.Call(cfg, "user:"+openID, userMessage, s)
 	if err != nil {

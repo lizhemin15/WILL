@@ -16,7 +16,6 @@ const (
 	ConfigKeyLLMApiKey        = "llm_api_key"
 	ConfigKeyLLMBaseURL       = "llm_base_url"
 	ConfigKeyLLMModel         = "llm_model"
-	ConfigKeyLLMSearchModel   = "llm_search_model" // 涉及搜索最新信息时临时切换的模型
 	ConfigKeyFeishuAppID      = "feishu_app_id"
 	ConfigKeyFeishuAppSecret  = "feishu_app_secret"
 	ConfigKeyAllowedOpenIDs   = "allowed_open_ids"

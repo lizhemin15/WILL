@@ -86,6 +86,50 @@ func TestConfig(cfg *config.Config) error {
 	return nil
 }
 
+// CallChat 发一次对话补全，返回首条回复内容（供规划/审查等用）
+func CallChat(cfg *config.Config, systemPrompt, userContent string) (string, error) {
+	if cfg == nil || cfg.LLMApiKey == "" {
+		return "", fmt.Errorf("未配置 LLM")
+	}
+	baseURL := strings.TrimRight(cfg.LLMBaseURL, "/")
+	model := cfg.LLMModel
+	if model == "" {
+		model = "gpt-4o-mini"
+	}
+	messages := []map[string]string{
+		{"role": "system", "content": systemPrompt},
+		{"role": "user", "content": userContent},
+	}
+	body := map[string]interface{}{"model": model, "messages": messages, "max_tokens": 2048}
+	bodyBytes, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.LLMApiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("LLM 请求失败: %d", resp.StatusCode)
+	}
+	var apiResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &apiResp); err != nil || len(apiResp.Choices) == 0 {
+		return "", fmt.Errorf("LLM 未返回有效内容")
+	}
+	return strings.TrimSpace(apiResp.Choices[0].Message.Content), nil
+}
+
 // Call 调用 LLM，解析出 config/memory/command/reply；若 s 非空则从 SQLite 拉取该用户记忆作为上下文
 func Call(cfg *config.Config, userScope string, userMessage string, s *store.Store) (Response, error) {
 	var out Response
@@ -97,9 +141,6 @@ func Call(cfg *config.Config, userScope string, userMessage string, s *store.Sto
 	model := cfg.LLMModel
 	if model == "" {
 		model = "gpt-4o-mini"
-	}
-	if NeedsSearch(userMessage) && cfg.LLMSearchModel != "" {
-		model = cfg.LLMSearchModel
 	}
 
 	sys := `你是 WILL 的助手。请先根据用户消息判断意图，再填对应字段。必须用纯 JSON 回复，只包含一个 JSON 对象，不要其他文字。
@@ -148,14 +189,15 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 	messages = append(messages, map[string]string{"role": "user", "content": userMessage})
 
 	body := map[string]interface{}{
-		"model":      model,
-		"messages":   messages,
-		"max_tokens": 1024,
+		"model":           model,
+		"messages":        messages,
+		"max_tokens":      1024,
+		"response_format": map[string]string{"type": "json_object"},
 	}
 	bodyBytes, _ := json.Marshal(body)
 
 	const maxParseRetries = 3
-	var lastParseErr error
+	var lastRaw string
 	for attempt := 0; attempt < maxParseRetries; attempt++ {
 		req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
 		if err != nil {
@@ -174,6 +216,16 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 			return out, readErr
 		}
 		if resp.StatusCode != http.StatusOK {
+			// 部分提供商不支持 response_format，降级重试（去掉 response_format）
+			if resp.StatusCode == 400 || resp.StatusCode == 422 {
+				bodyFallback := map[string]interface{}{
+					"model":      model,
+					"messages":   messages,
+					"max_tokens": 1024,
+				}
+				bodyBytes, _ = json.Marshal(bodyFallback)
+				continue
+			}
 			msg := string(raw)
 			if len(msg) > 300 {
 				msg = msg[:300] + "..."
@@ -198,18 +250,22 @@ JSON 格式（未用到的字段填空字符串或空对象）：
 			return out, fmt.Errorf("LLM 未返回内容")
 		}
 		content := strings.TrimSpace(apiResp.Choices[0].Message.Content)
-		content = extractJSON(content)
-		if err := json.Unmarshal([]byte(content), &out); err != nil {
-			lastParseErr = err
-			if attempt < maxParseRetries-1 {
-				time.Sleep(300 * time.Millisecond)
-				continue
-			}
-			return out, fmt.Errorf("解析 LLM 返回的 JSON 失败: %w", lastParseErr)
+		lastRaw = content
+		jsonStr := extractJSON(content)
+		if err := json.Unmarshal([]byte(jsonStr), &out); err == nil {
+			return out, nil
 		}
-		return out, nil
+		// 解析失败：短暂等待后重试
+		if attempt < maxParseRetries-1 {
+			time.Sleep(400 * time.Millisecond)
+		}
 	}
-	return out, fmt.Errorf("解析 LLM 返回的 JSON 失败: %w", lastParseErr)
+	// 全部重试失败：将原始内容作为 reply 降级返回，而非报错
+	out.Reply = lastRaw
+	if out.Reply == "" {
+		out.Reply = "已处理，但无法解析结构化结果。"
+	}
+	return out, nil
 }
 
 // CallForInstruction 执行一条指令并返回纯文本回复（用于定时任务等）；若指令涉及搜索最新信息则自动使用搜索模型
@@ -221,9 +277,6 @@ func CallForInstruction(cfg *config.Config, userScope string, instruction string
 	model := cfg.LLMModel
 	if model == "" {
 		model = "gpt-4o-mini"
-	}
-	if NeedsSearch(instruction) && cfg.LLMSearchModel != "" {
-		model = cfg.LLMSearchModel
 	}
 	sys := "你是执行定时任务的助手。请根据用户指令执行（可结合对话记录、待办、或搜索最新信息），然后给出简洁汇总回复。只输出结果内容，不要 JSON。"
 	messages := []map[string]string{{"role": "system", "content": sys}}
@@ -321,21 +374,6 @@ func Apply(s *store.Store, openID string, r Response) (command string, reply str
 	return strings.TrimSpace(r.Command), r.Reply
 }
 
-// NeedsSearch 判断内容是否涉及「搜索最新信息」，以便临时切换为搜索模型
-func NeedsSearch(s string) bool {
-	lower := strings.ToLower(strings.TrimSpace(s))
-	if lower == "" {
-		return false
-	}
-	keywords := []string{"搜索", "查一下", "最新", "今日", "新闻", "实时", "最近消息", "当前", "搜一下", "查最新", "检索"}
-	for _, k := range keywords {
-		if strings.Contains(lower, k) {
-			return true
-		}
-	}
-	return false
-}
-
 func truncateRunes(s string, max int) string {
 	if max <= 0 || utf8.RuneCountInString(s) <= max {
 		return s
@@ -343,20 +381,56 @@ func truncateRunes(s string, max int) string {
 	return string([]rune(s)[:max]) + "…"
 }
 
+// extractJSON 从字符串中提取第一个完整的 JSON 对象（用括号计数，避免截断/截错）
 func extractJSON(s string) string {
 	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "```") {
-		s = strings.TrimPrefix(s, "```json")
-		s = strings.TrimPrefix(s, "```")
-		s = strings.TrimSpace(s)
+	// 去掉 markdown 代码块包裹
+	for _, fence := range []string{"```json", "```"} {
+		if strings.HasPrefix(s, fence) {
+			s = strings.TrimPrefix(s, fence)
+			if idx := strings.LastIndex(s, "```"); idx > 0 {
+				s = s[:idx]
+			}
+			s = strings.TrimSpace(s)
+			break
+		}
 	}
 	start := strings.Index(s, "{")
 	if start < 0 {
 		return s
 	}
-	end := strings.LastIndex(s, "}")
-	if end < start {
-		return s[start:]
+	depth, i := 0, start
+	runes := []rune(s)
+	inStr, escape := false, false
+	for i < len(runes) {
+		ch := runes[i]
+		if escape {
+			escape = false
+			i++
+			continue
+		}
+		if ch == '\\' && inStr {
+			escape = true
+			i++
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			i++
+			continue
+		}
+		if !inStr {
+			if ch == '{' {
+				depth++
+			} else if ch == '}' {
+				depth--
+				if depth == 0 {
+					return string(runes[start : i+1])
+				}
+			}
+		}
+		i++
 	}
-	return s[start : end+1]
+	// 未找到完整对象，返回从 start 到末尾（可能是截断的，调用方会重试）
+	return string(runes[start:])
 }
