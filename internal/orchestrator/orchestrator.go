@@ -224,12 +224,20 @@ func Run(cfg *config.Config, userMessage string, runStep StepRunner) string {
 		runWave(wave)
 	}
 
+	// 单任务无需审查，直接返回执行结果
+	if len(plan.Tasks) == 1 {
+		return results[plan.Tasks[0].ID]
+	}
+
 	review, err := Reviewer(cfg, userMessage, plan, results)
 	if err != nil {
-		return "审查失败 — " + err.Error()
+		return buildResultSummary(plan, results)
 	}
-	if review.OK && review.Reply != "" {
-		return review.Reply
+	if review.OK {
+		if review.Reply != "" {
+			return review.Reply
+		}
+		return buildResultSummary(plan, results)
 	}
 	if len(review.ReworkTasks) > 0 {
 		for _, id := range review.ReworkTasks {
@@ -238,12 +246,12 @@ func Run(cfg *config.Config, userMessage string, runStep StepRunner) string {
 			}
 		}
 		review2, err := Reviewer(cfg, userMessage, plan, results)
-		if err == nil && review2.Reply != "" {
-			return review2.Reply
+		if err == nil {
+			if review2.Reply != "" {
+				return review2.Reply
+			}
+			return buildResultSummary(plan, results)
 		}
 	}
-	if review.Reply != "" {
-		return review.Reply
-	}
-	return "已按计划执行，请查看上方各步结果。"
+	return buildResultSummary(plan, results)
 }

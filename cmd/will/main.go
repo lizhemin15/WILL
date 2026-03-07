@@ -468,12 +468,47 @@ func runScheduledTasks(s *store.Store) {
 	}
 }
 
-// runMultiAgent 多智能体：先规划拆解任务，有依赖的按序执行、无依赖的并行，最后审查并可返工
+// runMultiAgent 多智能体：仅当消息明确包含多步操作信号时才走规划+并行+审查流程，否则直接单步执行
 func runMultiAgent(s *store.Store, cfg *config.Config, openID string, userMessage string) string {
+	if !isMultiStepRequest(userMessage) {
+		return runWithLLM(s, cfg, openID, userMessage)
+	}
 	runStep := func(step string) string {
 		return runWithLLM(s, cfg, openID, step)
 	}
 	return orchestrator.Run(cfg, userMessage, runStep)
+}
+
+// isMultiStepRequest 判断消息是否包含多步操作的信号词，避免简单问题走多智能体
+func isMultiStepRequest(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return false
+	}
+	signals := []string{
+		"然后", "再", "接着", "之后", "同时", "并且", "另外", "还要", "还需", "还有",
+		"先…再", "先…然后", "第一", "第二", "步骤",
+		"，再", "，然后", "，接着", "，同时",
+	}
+	count := 0
+	for _, s := range signals {
+		if strings.Contains(text, s) {
+			count++
+			if count >= 2 {
+				return true
+			}
+		}
+	}
+	// 包含顿号/逗号分隔的多个操作动词（粗判）
+	hasVerb := func(v string) bool { return strings.Contains(text, v) }
+	actionVerbs := []string{"添加", "删除", "完成", "查看", "检查", "修改", "列出", "搜索", "帮我"}
+	verbCount := 0
+	for _, v := range actionVerbs {
+		if hasVerb(v) {
+			verbCount++
+		}
+	}
+	return verbCount >= 2
 }
 
 // runWithLLM 用 LLM 解析用户意图，再按 intent 分发或执行 command/回复（单步，供多智能体调用）
