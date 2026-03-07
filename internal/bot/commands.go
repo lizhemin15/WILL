@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/yourusername/will/internal/config"
-	"github.com/yourusername/will/internal/feishu"
 	"github.com/yourusername/will/internal/store"
 )
 
@@ -237,11 +236,10 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 	if openID == "" {
 		return "无法获取你的 open_id。"
 	}
-	// /todo 或 /todo list：列出待办（序号从 1 开始）
-	if len(args) == 0 || (len(args) >= 1 && strings.ToLower(strings.TrimSpace(args[0])) == "list") {
-		list, err := feishu.ListTasks()
+	if len(args) == 0 || strings.ToLower(strings.TrimSpace(args[0])) == "list" {
+		list, err := s.ListTodos(openID)
 		if err != nil {
-			return "获取飞书任务失败: " + err.Error()
+			return "获取待办失败: " + err.Error()
 		}
 		if len(list) == 0 {
 			return "当前无待办。发送 /todo add <内容> 添加。"
@@ -268,25 +266,25 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if title == "" {
 			return "待办内容不能为空。"
 		}
-		if _, err := feishu.CreateTask(openID, title); err != nil {
-			return "创建失败: " + err.Error()
+		if _, err := s.AddTodo(openID, title); err != nil {
+			return "添加失败: " + err.Error()
 		}
 		return "已添加待办：" + title
 	case "done":
 		if len(args) < 2 {
 			return "用法: /todo done <序号> 或 /todo done 1 2 3"
 		}
-		list, err := feishu.ListTasks()
+		list, err := s.ListTodos(openID)
 		if err != nil {
-			return "获取飞书任务失败: " + err.Error()
+			return "获取待办失败: " + err.Error()
 		}
-		taskIDs, indices := resolveTodoIndices(list, args[1:])
-		if len(taskIDs) == 0 {
+		ids, indices := resolveTodoLocalIndices(list, args[1:])
+		if len(ids) == 0 {
 			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-		for _, tid := range taskIDs {
-			if ferr := feishu.CompleteTask(tid); ferr != nil {
-				log.Printf("[todo] 完成飞书任务 %s 失败: %v", tid, ferr)
+		for _, id := range ids {
+			if ferr := s.CompleteTodo(id, openID); ferr != nil {
+				log.Printf("[todo] 完成待办 %d 失败: %v", id, ferr)
 			}
 		}
 		return fmt.Sprintf("已将 %s 标为已完成。", formatTodoIndices(indices))
@@ -294,17 +292,17 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 		if len(args) < 2 {
 			return "用法: /todo delete <序号> 或 /todo delete 1 2 3"
 		}
-		list, err := feishu.ListTasks()
+		list, err := s.ListTodos(openID)
 		if err != nil {
-			return "获取飞书任务失败: " + err.Error()
+			return "获取待办失败: " + err.Error()
 		}
-		taskIDs, indices := resolveTodoIndices(list, args[1:])
-		if len(taskIDs) == 0 {
+		ids, indices := resolveTodoLocalIndices(list, args[1:])
+		if len(ids) == 0 {
 			return "序号需为 1 到 " + strconv.Itoa(len(list)) + " 的数字，可多个如 1 2 3"
 		}
-		for _, tid := range taskIDs {
-			if ferr := feishu.DeleteTask(tid); ferr != nil {
-				log.Printf("[todo] 删除飞书任务 %s 失败: %v", tid, ferr)
+		for _, id := range ids {
+			if ferr := s.DeleteTodo(id, openID); ferr != nil {
+				log.Printf("[todo] 删除待办 %d 失败: %v", id, ferr)
 			}
 		}
 		return fmt.Sprintf("已删除待办 %s。", formatTodoIndices(indices))
@@ -313,8 +311,7 @@ func cmdTodo(args []string, openID string, s *store.Store) string {
 	}
 }
 
-// resolveTodoIndices 将参数（如 ["1", "2"] 或 ["1,2,3"]）解析为飞书任务 ID 与序号；list 为当前列表，序号从 1 开始
-func resolveTodoIndices(list []feishu.TaskInfo, args []string) (taskIDs []string, indices []int) {
+func resolveTodoLocalIndices(list []store.TodoItem, args []string) (ids []int64, indices []int) {
 	seen := make(map[int]bool)
 	for _, a := range args {
 		for _, p := range strings.FieldsFunc(a, func(r rune) bool { return r == ',' || r == '，' || r == '、' }) {
@@ -324,11 +321,11 @@ func resolveTodoIndices(list []feishu.TaskInfo, args []string) (taskIDs []string
 				continue
 			}
 			seen[n] = true
-			taskIDs = append(taskIDs, list[n-1].ID)
+			ids = append(ids, list[n-1].ID)
 			indices = append(indices, n)
 		}
 	}
-	return taskIDs, indices
+	return ids, indices
 }
 
 // cmdStatus 展示当前会话状态（参考 OpenClaw /status）
@@ -345,7 +342,7 @@ func cmdStatus(openID string, s *store.Store, cfg *config.Config) string {
 	var convCount, todoTotal, todoPending, schedCount, memCount int
 	if s != nil {
 		convCount = s.ConversationCount(openID)
-		if todos, err := feishu.ListTasks(); err == nil {
+		if todos, err := s.ListTodos(openID); err == nil {
 			todoTotal = len(todos)
 			for _, t := range todos {
 				if !t.Done {

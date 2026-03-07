@@ -205,9 +205,9 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 	switch name {
 
 	case "todo_list":
-		list, err := feishu.ListTasks()
+		list, err := s.ListTodos(openID)
 		if err != nil {
-			return "获取飞书任务失败: " + err.Error()
+			return "获取待办失败: " + err.Error()
 		}
 		return formatTodoList(list)
 
@@ -218,11 +218,11 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		if title == "" {
 			return "待办内容不能为空。"
 		}
-		taskID, err := feishu.CreateTask(openID, title)
+		id, err := s.AddTodo(openID, title)
 		if err != nil {
-			return "创建飞书任务失败: " + err.Error()
+			return "添加待办失败: " + err.Error()
 		}
-		return fmt.Sprintf("已添加待办：%s（任务ID: %s）", title, taskID)
+		return fmt.Sprintf("已添加待办：%s（编号: %d）", title, id)
 
 	case "todo_update":
 		var p struct {
@@ -238,14 +238,14 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		if err != nil || idx < 1 {
 			return "序号无效，请传入 1 开始的数字。"
 		}
-		list, err := feishu.ListTasks()
+		list, err := s.ListTodos(openID)
 		if err != nil {
-			return "获取飞书任务失败: " + err.Error()
+			return "获取待办失败: " + err.Error()
 		}
 		if idx > len(list) {
 			return fmt.Sprintf("序号 %d 超出范围，当前共 %d 条。", idx, len(list))
 		}
-		if err := feishu.UpdateTask(list[idx-1].ID, newTitle); err != nil {
+		if err := s.UpdateTodoTitle(list[idx-1].ID, openID, newTitle); err != nil {
 			return "修改失败: " + err.Error()
 		}
 		return fmt.Sprintf("已将待办 [%d] 修改为：%s", idx, newTitle)
@@ -253,25 +253,25 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 	case "todo_done", "todo_delete":
 		var p struct{ Indices string `json:"indices"` }
 		_ = json.Unmarshal(argsJSON, &p)
-		list, err := feishu.ListTasks()
+		list, err := s.ListTodos(openID)
 		if err != nil {
-			return "获取飞书任务失败: " + err.Error()
+			return "获取待办失败: " + err.Error()
 		}
-		taskIDs, indices, errMsg := resolveTodoIndices(p.Indices, list)
+		ids, indices, errMsg := resolveTodoIDs(p.Indices, list)
 		if errMsg != "" {
 			return errMsg
 		}
 		if name == "todo_done" {
-			for _, tid := range taskIDs {
-				if ferr := feishu.CompleteTask(tid); ferr != nil {
-					log.Printf("[todo] 完成飞书任务 %s 失败: %v", tid, ferr)
+			for _, tid := range ids {
+				if ferr := s.CompleteTodo(tid, openID); ferr != nil {
+					log.Printf("[todo] 完成待办 %d 失败: %v", tid, ferr)
 				}
 			}
 			return fmt.Sprintf("已完成待办 %s。", formatIndices(indices))
 		}
-		for _, tid := range taskIDs {
-			if ferr := feishu.DeleteTask(tid); ferr != nil {
-				log.Printf("[todo] 删除飞书任务 %s 失败: %v", tid, ferr)
+		for _, tid := range ids {
+			if ferr := s.DeleteTodo(tid, openID); ferr != nil {
+				log.Printf("[todo] 删除待办 %d 失败: %v", tid, ferr)
 			}
 		}
 		return fmt.Sprintf("已删除待办 %s。", formatIndices(indices))
@@ -591,7 +591,7 @@ func loadLoc(cfg *config.Config) *time.Location {
 	return loc
 }
 
-func formatTodoList(list []feishu.TaskInfo) string {
+func formatTodoList(list []store.TodoItem) string {
 	if len(list) == 0 {
 		return "当前无待办。"
 	}
@@ -628,7 +628,7 @@ func formatScheduleList(list []store.UserScheduledTask, loc *time.Location) stri
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func resolveTodoIndices(indicesStr string, list []feishu.TaskInfo) (taskIDs []string, indices []int, errMsg string) {
+func resolveTodoIDs(indicesStr string, list []store.TodoItem) (ids []int64, indices []int, errMsg string) {
 	if indicesStr == "" {
 		return nil, nil, "请指定待办序号（1开始，多个逗号分隔，如 1 或 1,2）。"
 	}
@@ -642,13 +642,13 @@ func resolveTodoIndices(indicesStr string, list []feishu.TaskInfo) (taskIDs []st
 			continue
 		}
 		seen[n] = true
-		taskIDs = append(taskIDs, list[n-1].ID)
+		ids = append(ids, list[n-1].ID)
 		indices = append(indices, n)
 	}
-	if len(taskIDs) == 0 {
+	if len(ids) == 0 {
 		return nil, nil, fmt.Sprintf("序号需在 1 到 %d 之间。", len(list))
 	}
-	return taskIDs, indices, ""
+	return ids, indices, ""
 }
 
 func formatIndices(indices []int) string {

@@ -375,6 +375,78 @@ func (s *Store) ConversationCount(openID string) int {
 	return n
 }
 
+// ── Todos (本地存储，不依赖飞书 Task API) ─────────────────────────────────────
+
+// TodoItem 代表一条本地待办
+type TodoItem struct {
+	ID    int64
+	Title string
+	Done  bool
+}
+
+// AddTodo 新增一条待办，返回自增 ID
+func (s *Store) AddTodo(openID, title string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"INSERT INTO todos(open_id,title,status,created_at) VALUES(?,?,?,?)",
+		openID, title, "pending", time.Now().Unix(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// ListTodos 返回指定用户的所有待办（未完成在前）
+func (s *Store) ListTodos(openID string) ([]TodoItem, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(
+		"SELECT id,title,status FROM todos WHERE open_id=? ORDER BY status ASC, created_at ASC",
+		openID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TodoItem
+	for rows.Next() {
+		var t TodoItem
+		var status string
+		if err := rows.Scan(&t.ID, &t.Title, &status); err != nil {
+			return nil, err
+		}
+		t.Done = status == "done"
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// CompleteTodo 将指定待办标记为完成
+func (s *Store) CompleteTodo(id int64, openID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("UPDATE todos SET status='done' WHERE id=? AND open_id=?", id, openID)
+	return err
+}
+
+// DeleteTodo 删除指定待办
+func (s *Store) DeleteTodo(id int64, openID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("DELETE FROM todos WHERE id=? AND open_id=?", id, openID)
+	return err
+}
+
+// UpdateTodoTitle 修改待办标题
+func (s *Store) UpdateTodoTitle(id int64, openID, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("UPDATE todos SET title=? WHERE id=? AND open_id=?", title, id, openID)
+	return err
+}
+
 // ── Pair Tokens ───────────────────────────────────────────────────────────────
 
 // SavePairToken 保存一个短期有效的配对令牌（scope=system:pair，key=token，value=expiry unix）
