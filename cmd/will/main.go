@@ -52,7 +52,8 @@ func markSeen(id string) bool {
 	return true
 }
 
-const Version = "0.1.0"
+// Version 由构建时 -ldflags "-X main.Version=vX.Y.Z" 注入
+var Version = "dev"
 
 func main() {
 	s, err := store.Open("")
@@ -66,15 +67,23 @@ func main() {
 		cfg = config.LoadFromStore(s)
 	}
 
-	// 检查更新后通知
+	// 尽早初始化飞书客户端，确保更新后通知能正常发出
+	if cfg.FeishuAppID != "" && cfg.FeishuAppSecret != "" {
+		feishu.InitClient(cfg.FeishuAppID, cfg.FeishuAppSecret)
+	}
+
+	// 检查更新后通知（必须在 InitClient 之后）
 	if notifyID, ok := s.GetConfig(store.ConfigKeyPostUpdateNotifyOpenID); ok && notifyID != "" {
 		_ = s.SetConfig(store.ConfigKeyPostUpdateNotifyOpenID, "")
-		notes := updater.ReleaseNotes(Version)
-		msg := "WILL 已更新到 v" + Version + "。"
+		ver := strings.TrimPrefix(Version, "v")
+		notes := updater.ReleaseNotes(ver)
+		msg := "WILL 已更新到 v" + ver + "。"
 		if notes != "" {
 			msg += "\n\n更新内容：\n" + notes
 		}
-		_ = feishu.SendMessageToUser(notifyID, msg)
+		if err := feishu.SendMessageToUser(notifyID, msg); err != nil {
+			log.Printf("[updater] 发送更新通知失败: %v", err)
+		}
 	}
 
 	// 启动定时任务 goroutine
