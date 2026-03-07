@@ -34,12 +34,16 @@ func StartWSClient(appID, appSecret string, onMessage ProcessMessageFunc) {
 			// 异步处理并回复，避免 LLM 调用超过飞书 3 秒限制导致超时
 			go func() {
 				reply, sendReply := onMessage(openID, messageID, text)
-				if sendReply && reply != "" {
-					if err := ReplyMessage(messageID, reply); err != nil {
-						log.Printf("[feishu] 回复失败: %v", err)
+				if sendReply && reply != "" && openID != "" {
+					// 用「发消息给用户」确保单聊里能收到；Reply 接口有时在客户端不展示
+					if err := SendMessageToUser(openID, reply); err != nil {
+						log.Printf("[feishu] 发消息失败: %v，尝试回复原消息", err)
+						_ = ReplyMessage(messageID, reply)
 					} else {
-						log.Printf("[feishu] 已回复 message_id=%q", messageID)
+						log.Printf("[feishu] 已发消息给 open_id=%q", openID)
 					}
+				} else if sendReply && reply != "" {
+					_ = ReplyMessage(messageID, reply)
 				} else {
 					log.Printf("[feishu] 本条不回复 sendReply=%v reply_empty=%v", sendReply, reply == "")
 				}
