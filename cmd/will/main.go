@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yourusername/will/internal/bot"
 	"github.com/yourusername/will/internal/config"
@@ -444,6 +447,22 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		_ = json.Unmarshal(argsJSON, &p)
 		return runTask(s, cfg, strings.TrimSpace(p.Command))
 
+	case "fetch_url":
+		var p struct{ URL string `json:"url"` }
+		_ = json.Unmarshal(argsJSON, &p)
+		rawURL := strings.TrimSpace(p.URL)
+		if rawURL == "" {
+			return "请提供要请求的 URL。"
+		}
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return "URL 格式无效：" + err.Error()
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return "仅支持 http 或 https 链接。"
+		}
+		return fetchURL(rawURL)
+
 	case "worker_list":
 		if globalHub == nil {
 			return "当前不是主节点模式，无从节点管理。"
@@ -861,6 +880,39 @@ func runTask(s *store.Store, cfg *config.Config, instruction string) string {
 	defer cancel()
 	res := exec.Run(ctx, instruction, "", 5*time.Minute)
 	return res.String()
+}
+
+const fetchURLMaxRunes = 60000
+
+var fetchURLClient = &http.Client{Timeout: 30 * time.Second}
+
+func fetchURL(rawURL string) string {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "请求创建失败：" + err.Error()
+	}
+	req.Header.Set("User-Agent", "WILL/1.0 (fetch_url)")
+	resp, err := fetchURLClient.Do(req)
+	if err != nil {
+		return "请求失败：" + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Sprintf("HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return "读取响应失败：" + err.Error()
+	}
+	text := string(body)
+	if !utf8.ValidString(text) {
+		text = strings.ToValidUTF8(text, "")
+	}
+	n := utf8.RuneCountInString(text)
+	if n > fetchURLMaxRunes {
+		text = string([]rune(text)[:fetchURLMaxRunes]) + "\n\n（内容过长已截断。）"
+	}
+	return text
 }
 
 // orchestrator 入口：复杂多步任务用规划-执行-审查，简单任务直接 runWithLLM

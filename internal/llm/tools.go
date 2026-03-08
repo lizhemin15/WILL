@@ -153,6 +153,16 @@ var toolDefs = []map[string]interface{}{
 	{
 		"type": "function",
 		"function": map[string]interface{}{
+			"name":        "fetch_url",
+			"description": "通过 HTTP GET 获取网页或 API 的文本内容，无需无头浏览器。适合获取新闻、API 数据、RSS、静态页面等。无头浏览器不可用时优先用此工具访问网络；需要执行 JavaScript 或复杂交互时再考虑 browser-use 等技能。",
+			"parameters": objectParams(map[string]interface{}{
+				"url": strParam("要请求的完整 URL，需以 http:// 或 https:// 开头"),
+			}, "url"),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
 			"name":        "worker_list",
 			"description": "列出所有已连接的从节点（子机器人）名称和状态，主节点模式下可用",
 			"parameters":  emptyParams(),
