@@ -15,11 +15,35 @@ import (
 
 var installClient = &http.Client{Timeout: 120 * time.Second}
 
-// InstallFromRepoZip 从「整库 zip」（如 GitHub archive）中只解压 subpath 到 ~/.will/skills/<name>。
+const installDirEnv = "WILL_SKILLS_DIR"
+
+// installBaseDir 返回 skill 安装根目录。未设置 WILL_SKILLS_DIR 时使用当前工作目录下的 skills（与 will 同目录）。
+func installBaseDir() string {
+	if d := os.Getenv(installDirEnv); d != "" {
+		d = strings.TrimSpace(d)
+		if d == "~" || strings.HasPrefix(d, "~/") {
+			home, _ := os.UserHomeDir()
+			if home != "" {
+				if d == "~" {
+					return filepath.Join(home, "skills")
+				}
+				return filepath.Join(home, d[2:])
+			}
+			return filepath.Join(".", d[1:])
+		}
+		return d
+	}
+	cwd, _ := os.Getwd()
+	if cwd == "" {
+		cwd = "."
+	}
+	return filepath.Join(cwd, "skills")
+}
+
+// InstallFromRepoZip 从「整库 zip」（如 GitHub archive）中只解压 subpath 到安装目录 <base>/<name>。
 // 用于复用 OpenClaw 生态仓库时按技能名只拉取对应子目录。
 func InstallFromRepoZip(zipURL, subpath, name string) (installedDir string, err error) {
-	home, _ := os.UserHomeDir()
-	baseDir := filepath.Join(home, ".will", "skills")
+	baseDir := installBaseDir()
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return "", err
 	}
@@ -102,10 +126,9 @@ func InstallFromRepoZip(zipURL, subpath, name string) (installedDir string, err 
 	return dest, nil
 }
 
-// InstallFromURL 从 zip 或 tar.gz URL 下载并解压到 ~/.will/skills/<name>。name 为空则从归档内首目录名推断。
+// InstallFromURL 从 zip 或 tar.gz URL 下载并解压到安装目录 <base>/<name>。name 为空则从归档内首目录名推断。
 func InstallFromURL(url, name string) (installedDir string, err error) {
-	home, _ := os.UserHomeDir()
-	baseDir := filepath.Join(home, ".will", "skills")
+	baseDir := installBaseDir()
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return "", err
 	}
