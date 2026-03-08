@@ -17,10 +17,11 @@ type Result struct {
 	Err      error
 }
 
-// Run 在本地执行系统命令。timeout 为 0 表示不限制。
+// Run 通过系统 shell 执行命令字符串，支持管道、重定向、&&、|| 等全部 shell 语法。
+// Unix 使用 sh -c，Windows 使用 cmd /c。timeout 为 0 表示不限制。
 func Run(ctx context.Context, command string, workDir string, timeout time.Duration) Result {
-	cmdLine := parseCommand(command)
-	if len(cmdLine) == 0 {
+	command = strings.TrimSpace(command)
+	if command == "" {
 		return Result{ExitCode: -1, Err: fmt.Errorf("empty command")}
 	}
 
@@ -31,10 +32,10 @@ func Run(ctx context.Context, command string, workDir string, timeout time.Durat
 	}
 
 	var cmd *exec.Cmd
-	if len(cmdLine) == 1 {
-		cmd = exec.CommandContext(ctx, cmdLine[0])
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "cmd", "/c", command)
 	} else {
-		cmd = exec.CommandContext(ctx, cmdLine[0], cmdLine[1:]...)
+		cmd = exec.CommandContext(ctx, "sh", "-c", command)
 	}
 	if workDir != "" {
 		cmd.Dir = workDir
@@ -54,50 +55,6 @@ func Run(ctx context.Context, command string, workDir string, timeout time.Durat
 		out.ExitCode = cmd.ProcessState.ExitCode()
 	}
 	return out
-}
-
-func parseCommand(command string) []string {
-	command = strings.TrimSpace(command)
-	if command == "" {
-		return nil
-	}
-	if runtime.GOOS == "windows" {
-		return parseCommandWindows(command)
-	}
-	return parseCommandUnix(command)
-}
-
-func parseCommandUnix(s string) []string {
-	var parts []string
-	var b strings.Builder
-	quote := rune(0)
-	for _, r := range s {
-		switch {
-		case quote != 0:
-			if r == quote {
-				quote = 0
-			} else {
-				b.WriteRune(r)
-			}
-		case r == '"' || r == '\'':
-			quote = r
-		case r == ' ' || r == '\t':
-			if b.Len() > 0 {
-				parts = append(parts, b.String())
-				b.Reset()
-			}
-		default:
-			b.WriteRune(r)
-		}
-	}
-	if b.Len() > 0 {
-		parts = append(parts, b.String())
-	}
-	return parts
-}
-
-func parseCommandWindows(s string) []string {
-	return strings.Fields(s)
 }
 
 func (r Result) String() string {

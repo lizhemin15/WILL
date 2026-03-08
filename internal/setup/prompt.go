@@ -56,8 +56,8 @@ func RunStartup(s *store.Store) *config.Config {
 		if strings.TrimSpace(line) == "2" {
 			return ensurePeerPairing(s, reader)
 		}
-		// 记录模式到 DB，下次启动不再询问
-		_ = s.SetConfig(store.ConfigKeyMode, string(config.ModeStandalone))
+		// 选飞书通信即为主节点（main），同时启动 HTTP 服务供从节点配对和 WebSocket 连接
+		_ = s.SetConfig(store.ConfigKeyMode, string(config.ModeMain))
 	}
 
 	// 飞书模式：确保 LLM 和飞书凭证有效
