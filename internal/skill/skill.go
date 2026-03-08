@@ -301,3 +301,92 @@ func FormatForPrompt(skills []Skill) string {
 	}
 	return b.String()
 }
+
+// SearchResult 供调用方格式化的搜索结果
+type SearchResult struct {
+	Local  []Skill         // 已安装且匹配的（含 Body）
+	Remote []RegistryEntry // 未安装但注册表匹配的
+}
+
+// Search 按关键词搜索：本地已加载 + 远程注册表，用于完成任务时查找并可选安装技能。
+func Search(workDir, query string) (SearchResult, error) {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return SearchResult{}, nil
+	}
+	local := LoadAll(workDir)
+	remote, err := FetchRegistry()
+	if err != nil {
+		remote = nil
+	}
+	var localMatch []Skill
+	for _, s := range local {
+		if s.Disabled {
+			continue
+		}
+		if strings.Contains(strings.ToLower(s.Name), q) || strings.Contains(strings.ToLower(s.Description), q) || strings.Contains(strings.ToLower(s.Body), q) {
+			localMatch = append(localMatch, s)
+		}
+	}
+	have := make(map[string]struct{})
+	for _, s := range localMatch {
+		have[s.Name] = struct{}{}
+	}
+	var remoteMatch []RegistryEntry
+	for _, e := range remote {
+		if _, ok := have[e.Name]; ok {
+			continue
+		}
+		if strings.Contains(strings.ToLower(e.Name), q) || strings.Contains(strings.ToLower(e.Description), q) {
+			remoteMatch = append(remoteMatch, e)
+		}
+	}
+	return SearchResult{Local: localMatch, Remote: remoteMatch}, nil
+}
+
+// FormatSearchResult 将搜索结果格式化为给 LLM 的文案
+func FormatSearchResult(r SearchResult) string {
+	var b strings.Builder
+	if len(r.Local) > 0 {
+		b.WriteString("【已安装且匹配的技能】可直接按以下说明执行：\n\n")
+		for _, s := range r.Local {
+			b.WriteString("## " + s.Name + "\n" + s.Description + "\n\n" + s.Body + "\n\n")
+		}
+	}
+	if len(r.Remote) > 0 {
+		b.WriteString("【未安装但可安装的匹配技能】使用 skill_install 安装后即可使用：\n")
+		for _, e := range r.Remote {
+			b.WriteString("- " + e.Name + " — " + e.Description + "\n")
+		}
+		b.WriteString("\n安装后我会自动获得该技能说明并可按说明执行。")
+	}
+	if b.Len() == 0 {
+		return "未找到与任务相关的技能。可尝试其他关键词或直接描述任务由我按通用能力处理。"
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// GetBodyByName 返回已安装技能的名称与正文；若未安装或无法读取则 description 与 body 为空。
+func GetBodyByName(workDir, name string) (description, body string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", ""
+	}
+	all := LoadAll(workDir)
+	for _, s := range all {
+		if s.Name == name {
+			return s.Description, s.Body
+		}
+	}
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, ".will", "skills", name, skillFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	s := parseSKILL(string(data))
+	if s != nil {
+		return s.Description, s.Body
+	}
+	return "", ""
+}

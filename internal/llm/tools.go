@@ -182,6 +182,16 @@ var toolDefs = []map[string]interface{}{
 	{
 		"type": "function",
 		"function": map[string]interface{}{
+			"name":        "skill_search",
+			"description": "根据任务或关键词搜索相关技能（先搜本地已安装，再搜远程可安装）。完成任务时应先调用此工具查找相关技能；若仅远程有匹配则用 skill_install 安装后再按技能说明执行。返回中已安装技能会带完整说明可直接使用，未安装的会列出名称供你调用 skill_install。",
+			"parameters": objectParams(map[string]interface{}{
+				"query": strParam("与任务相关的关键词，如 pdf、vue、文档、邮件、excel 等"),
+			}, "query"),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
 			"name":        "skill_list_local",
 			"description": "列出当前已加载的 Skill（含未就绪的及原因）。用户说「有哪些 skill」「已安装的技能」「技能列表」时使用",
 			"parameters":  emptyParams(),
@@ -199,7 +209,7 @@ var toolDefs = []map[string]interface{}{
 		"type": "function",
 		"function": map[string]interface{}{
 			"name":        "skill_install",
-			"description": "安装 Skill：从注册表按名称安装，或从 zip/tar.gz 链接直接安装。用户说「安装 skill xxx」「装一个叫 xxx 的技能」「从链接安装」时使用",
+			"description": "安装 Skill：从注册表按名称安装，或从 zip/tar.gz 链接直接安装。当 skill_search 发现任务相关技能未安装时，应调用此工具安装；安装完成后会返回该技能说明，请按说明执行任务。用户说「安装 skill xxx」时也可直接使用。",
 			"parameters": objectParams(map[string]interface{}{
 				"name_or_url": strParam("Skill 名称（从注册表安装）或完整的 http(s) 链接（zip/tar.gz 直接安装）"),
 			}, "name_or_url"),

@@ -21,6 +21,7 @@ import (
 	"github.com/yourusername/will/internal/orchestrator"
 	"github.com/yourusername/will/internal/peer"
 	"github.com/yourusername/will/internal/setup"
+	"github.com/yourusername/will/internal/skill"
 	"github.com/yourusername/will/internal/store"
 	"github.com/yourusername/will/internal/updater"
 )
@@ -487,6 +488,21 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		}
 		return fmt.Sprintf("已向从节点「%s」发送升级指令，升级完成后将自动重连。", p.WorkerName)
 
+	case "skill_search":
+		var p struct {
+			Query string `json:"query"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		query := strings.TrimSpace(p.Query)
+		if query == "" {
+			return "请提供搜索关键词，如：pdf、vue、文档、邮件。"
+		}
+		r, err := skill.Search("", query)
+		if err != nil {
+			return "搜索失败：" + err.Error()
+		}
+		return skill.FormatSearchResult(r)
+
 	case "skill_list_local":
 		return bot.SkillRun([]string{"list"})
 
@@ -634,7 +650,14 @@ func handlePendingSkillConfirm(s *store.Store, openID, text string) (reply strin
 			default:
 				return "未知操作，已清除。", true
 			}
-			return bot.SkillRun(args), true
+			reply := bot.SkillRun(args)
+			if pending.Action == "install" && strings.TrimSpace(pending.NameOrURL) != "" {
+				desc, body := skill.GetBodyByName("", strings.TrimSpace(pending.NameOrURL))
+				if body != "" {
+					reply += "\n\n【技能说明】\n" + desc + "\n\n" + body
+				}
+			}
+			return reply, true
 		}
 	}
 	return "", false

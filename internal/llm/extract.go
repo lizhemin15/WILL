@@ -377,6 +377,7 @@ func buildSystemPrompt(cfg *config.Config, scope string, s *store.Store) string 
 - 使用工具完成待办、定时任务、版本检查、记忆等操作；普通对话直接文字回复
 - 直接执行用户意图，不要输出选项菜单或让用户"回复某某"
 - 用户指定多个定时时间点时，多次调用 schedule_add 工具（每个时间点一次）
+- 完成任务时先使用 skill_search 按任务关键词搜索相关技能；若仅有远程匹配则用 skill_install 安装；安装后会返回技能说明，请按说明执行任务
 - 当前时间：` + now
 
 	if s != nil {
