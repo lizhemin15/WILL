@@ -655,6 +655,7 @@ func handlePendingSkillConfirm(s *store.Store, openID, text string) (reply strin
 				desc, body := skill.GetBodyByName("", strings.TrimSpace(pending.NameOrURL))
 				if body != "" {
 					reply += "\n\n【技能说明】\n" + desc + "\n\n" + body
+					reply += "\n\n请使用 shell_exec 执行上述技能说明中的命令完成用户任务。"
 				}
 			}
 			return reply, true

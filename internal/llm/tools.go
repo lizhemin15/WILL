@@ -144,7 +144,7 @@ var toolDefs = []map[string]interface{}{
 		"type": "function",
 		"function": map[string]interface{}{
 			"name":        "shell_exec",
-			"description": "在当前节点执行 shell 命令并返回输出",
+			"description": "在当前节点执行 shell 命令并返回输出。执行技能时用此工具运行技能说明中的命令（如 browser-use \"用户任务\"、pip install 等），勿使用技能里可能出现的 run_command、run_pip_install 等工具名。安装或 prepare 成功后应直接调用本工具执行任务，不要重复安装或 prepare。",
 			"parameters": objectParams(map[string]interface{}{
 				"command": strParam("要执行的 shell 命令"),
 			}, "command"),
@@ -219,7 +219,7 @@ var toolDefs = []map[string]interface{}{
 		"type": "function",
 		"function": map[string]interface{}{
 			"name":        "skill_prepare",
-			"description": "为指定 Skill 安装依赖（如执行 brew install）。用户说「给 xxx 装依赖」「准备 xxx 环境」「修复 xxx 未就绪」时使用",
+			"description": "为指定 Skill 安装依赖（如执行 brew install）。用户说「给 xxx 装依赖」「准备 xxx 环境」「修复 xxx 未就绪」时使用。依赖就绪后请用 shell_exec 执行技能要求的命令完成用户任务，不要再次 prepare。",
 			"parameters": objectParams(map[string]interface{}{
 				"name": strParam("Skill 名称，与 skill_list_local 返回的名称一致"),
 			}, "name"),

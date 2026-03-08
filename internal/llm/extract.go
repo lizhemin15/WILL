@@ -378,6 +378,7 @@ func buildSystemPrompt(cfg *config.Config, scope string, s *store.Store) string 
 - 直接执行用户意图，不要输出选项菜单或让用户"回复某某"
 - 用户指定多个定时时间点时，多次调用 schedule_add 工具（每个时间点一次）
 - 完成任务时先使用 skill_search 按任务关键词搜索相关技能；若仅有远程匹配则用 skill_install 安装；安装后会返回技能说明，请按说明执行任务
+- 执行技能步骤时请使用 shell_exec 运行技能说明中的命令（如 browser-use "用户任务"）；技能说明中若出现 run_command、run_pip_install 等工具名，在本助手中均用 shell_exec 执行对应命令。依赖或安装/prepare 成功后请直接使用 shell_exec 执行任务，不要重复安装或 prepare
 - 当前时间：` + now
 
 	if s != nil {
