@@ -15,6 +15,93 @@ import (
 
 var installClient = &http.Client{Timeout: 120 * time.Second}
 
+// InstallFromRepoZip 从「整库 zip」（如 GitHub archive）中只解压 subpath 到 ~/.will/skills/<name>。
+// 用于复用 OpenClaw 生态仓库时按技能名只拉取对应子目录。
+func InstallFromRepoZip(zipURL, subpath, name string) (installedDir string, err error) {
+	home, _ := os.UserHomeDir()
+	baseDir := filepath.Join(home, ".will", "skills")
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodGet, zipURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "WILL/1.0")
+	resp, err := installClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
+	}
+	tmp, err := os.CreateTemp("", "will-skill-*.zip")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		return "", err
+	}
+	_ = tmp.Sync()
+	zr, err := zip.OpenReader(tmp.Name())
+	if err != nil {
+		return "", err
+	}
+	defer zr.Close()
+	subpath = strings.Trim(filepath.ToSlash(subpath), "/")
+	prefix := ""
+	for _, f := range zr.File {
+		p := strings.Trim(f.Name, "/")
+		if p == "" {
+			continue
+		}
+		parts := strings.SplitN(p, "/", 2)
+		if len(parts) == 2 && (prefix == "" || parts[0] == prefix) {
+			if prefix == "" {
+				prefix = parts[0]
+			}
+			if strings.HasPrefix(p, prefix+"/"+subpath) {
+				break
+			}
+		}
+	}
+	if prefix == "" {
+		return "", fmt.Errorf("zip 格式异常，未找到子路径 %s", subpath)
+	}
+	extractPrefix := filepath.ToSlash(prefix) + "/" + subpath + "/"
+	dest := filepath.Join(baseDir, name)
+	_ = os.MkdirAll(dest, 0755)
+	for _, f := range zr.File {
+		entryName := filepath.ToSlash(f.Name)
+		if !strings.HasPrefix(entryName, extractPrefix) {
+			continue
+		}
+		rel := entryName[len(extractPrefix):]
+		if rel == "" {
+			continue
+		}
+		fname := filepath.Join(dest, filepath.FromSlash(rel))
+		if f.FileInfo().IsDir() {
+			_ = os.MkdirAll(fname, 0755)
+			continue
+		}
+		_ = os.MkdirAll(filepath.Dir(fname), 0755)
+		rc, _ := f.Open()
+		out, _ := os.Create(fname)
+		if out != nil && rc != nil {
+			io.Copy(out, rc)
+			out.Close()
+		}
+		if rc != nil {
+			rc.Close()
+		}
+	}
+	return dest, nil
+}
+
 // InstallFromURL 从 zip 或 tar.gz URL 下载并解压到 ~/.will/skills/<name>。name 为空则从归档内首目录名推断。
 func InstallFromURL(url, name string) (installedDir string, err error) {
 	home, _ := os.UserHomeDir()

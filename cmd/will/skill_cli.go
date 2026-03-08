@@ -63,7 +63,7 @@ func runSkillList(args []string) {
 	if remote {
 		entries, err := skill.FetchRegistry()
 		if err != nil {
-			log.Fatalf("拉取注册表失败: %v\n请设置环境变量 WILL_SKILLS_REGISTRY_URL 指向注册表 JSON 地址。", err)
+			log.Fatalf("拉取注册表失败: %v", err)
 		}
 		if len(entries) == 0 {
 			fmt.Println("注册表为空")
@@ -114,7 +114,11 @@ func runSkillInstall(args []string) {
 	}
 	for _, e := range entries {
 		if e.Name == target {
-			dir, err = skill.InstallFromURL(e.URL, e.Name)
+			if e.RepoSubpath != "" {
+				dir, err = skill.InstallFromRepoZip(e.URL, e.RepoSubpath, e.Name)
+			} else {
+				dir, err = skill.InstallFromURL(e.URL, e.Name)
+			}
 			if err != nil {
 				log.Fatalf("安装 %s 失败: %v", target, err)
 			}

@@ -105,8 +105,8 @@ func cmdHelp() string {
 /pair              — 生成从节点配对码（10分钟有效，用于绑定新机器人）
 /workers           — 列出所有已连接的从节点名称
 /skills            — 列出已加载的 Skills（可被 AI 搜索复用）
-/skill list        — 同上；/skill list --remote 从注册表列出可安装项
-/skill install <名> — 从注册表或链接安装 Skill
+/skill list        — 同上；/skill list --remote 从 OpenClaw 生态（GitHub）列出可安装项
+/skill install <名> — 从生态仓库或链接安装 Skill（无需配置，默认复用 OpenClaw 技能库）
 /skill prepare <名> — 为 Skill 安装依赖；/skill update 批量更新
 
 自然语言也可：直接说「添加待办 xxx」「每天9点提醒我」「现在几点」等，AI 会直接处理。`
@@ -157,7 +157,7 @@ func SkillRun(args []string) string {
 		if remote {
 			entries, err := skill.FetchRegistry()
 			if err != nil {
-				return fmt.Sprintf("拉取注册表失败：%v\n请配置环境变量 WILL_SKILLS_REGISTRY_URL。", err)
+				return fmt.Sprintf("拉取注册表失败：%v", err)
 			}
 			if len(entries) == 0 {
 				return "注册表为空。"
@@ -188,7 +188,12 @@ func SkillRun(args []string) string {
 		}
 		for _, e := range entries {
 			if e.Name == nameOrURL {
-				dir, err := skill.InstallFromURL(e.URL, e.Name)
+				var dir string
+				if e.RepoSubpath != "" {
+					dir, err = skill.InstallFromRepoZip(e.URL, e.RepoSubpath, e.Name)
+				} else {
+					dir, err = skill.InstallFromURL(e.URL, e.Name)
+				}
 				if err != nil {
 					return fmt.Sprintf("安装 %s 失败：%v", nameOrURL, err)
 				}
@@ -215,7 +220,12 @@ func SkillRun(args []string) string {
 		for _, e := range entries {
 			for _, s := range installed {
 				if s.Name == e.Name {
-					_, err := skill.InstallFromURL(e.URL, e.Name)
+					var err error
+					if e.RepoSubpath != "" {
+						_, err = skill.InstallFromRepoZip(e.URL, e.RepoSubpath, e.Name)
+					} else {
+						_, err = skill.InstallFromURL(e.URL, e.Name)
+					}
 					if err != nil {
 						continue
 					}
