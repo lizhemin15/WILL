@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/yourusername/will/internal/config"
+	"github.com/yourusername/will/internal/skill"
 	"github.com/yourusername/will/internal/store"
 )
 
@@ -64,6 +65,9 @@ var AllowedConfigKeys = map[string]string{
 
 // PendingConfigKey 存在 memory 中的待确认配置变更键
 const PendingConfigKey = "_pending_config"
+
+// PendingSkillKey 存在 memory 中的待确认 Skill 敏感操作（安装/准备依赖/更新）
+const PendingSkillKey = "_pending_skill"
 
 // TestConfig 校验 LLM 配置是否可用
 func TestConfig(cfg *config.Config) error {
@@ -393,6 +397,10 @@ func buildSystemPrompt(cfg *config.Config, scope string, s *store.Store) string 
 				}
 			}
 		}
+	}
+	// 注入可用 Skills（OpenClaw 风格），供模型搜索并复用
+	if skillsText := skill.FormatForPrompt(skill.Load("")); skillsText != "" {
+		sys += skillsText
 	}
 	return sys
 }

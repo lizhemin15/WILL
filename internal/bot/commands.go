@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yourusername/will/internal/config"
+	"github.com/yourusername/will/internal/skill"
 	"github.com/yourusername/will/internal/store"
 )
 
@@ -59,6 +60,10 @@ func HandleCommand(text string, openID string, s *store.Store, cfg *config.Confi
 			return cmdReset(openID, s), true
 		case "pair":
 			return cmdPair(openID, s, cfg), true
+		case "skills":
+			return cmdSkills(), true
+		case "skill":
+			return cmdSkillHelp(), true
 		}
 		return "用法: /help", true
 	}
@@ -76,6 +81,8 @@ func HandleCommand(text string, openID string, s *store.Store, cfg *config.Confi
 		return cmdStatus(openID, s, cfg), true
 	case "reset", "new":
 		return cmdReset(openID, s), true
+	case "skill":
+		return SkillRun(args), true
 	default:
 		return "", false
 	}
@@ -97,8 +104,133 @@ func cmdHelp() string {
 /allow me          — 将当前用户加入授权列表
 /pair              — 生成从节点配对码（10分钟有效，用于绑定新机器人）
 /workers           — 列出所有已连接的从节点名称
+/skills            — 列出已加载的 Skills（可被 AI 搜索复用）
+/skill list        — 同上；/skill list --remote 从注册表列出可安装项
+/skill install <名> — 从注册表或链接安装 Skill
+/skill prepare <名> — 为 Skill 安装依赖；/skill update 批量更新
 
 自然语言也可：直接说「添加待办 xxx」「每天9点提醒我」「现在几点」等，AI 会直接处理。`
+}
+
+func cmdSkills() string {
+	all := skill.LoadAll("")
+	if len(all) == 0 {
+		return "当前未加载任何 Skill。\n在 ./skills 或 ~/.will/skills 下放置以 SKILL.md 为入口的目录，或使用 /skill install <name> 从注册表安装；环境变量 WILL_SKILLS_EXTRA_DIRS 可添加更多目录。"
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("已加载 %d 个 Skill（AI 会根据意图自动搜索并复用）：\n", len(all)))
+	for _, s := range all {
+		line := fmt.Sprintf("- %s：%s", s.Name, s.Description)
+		if s.Disabled && len(s.Missing) > 0 {
+			line += fmt.Sprintf(" [未就绪: %s]", strings.Join(s.Missing, "; "))
+		}
+		b.WriteString(line + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func cmdSkillHelp() string {
+	return `Skill 管理（通过飞书）：
+/skill list           — 列出已加载的 Skill
+/skill list --remote  — 从注册表列出可安装的 Skill
+/skill install <名称> — 从注册表安装（需配置 WILL_SKILLS_REGISTRY_URL）
+/skill install <链接> — 从 zip/tar.gz 链接直接安装
+/skill prepare <名称> — 为指定 Skill 安装依赖（如 brew）
+/skill update         — 从注册表更新已安装的 Skill`
+}
+
+// SkillRun 执行 skill 子命令并返回结果文案，供飞书命令与 LLM 工具共用
+func SkillRun(args []string) string {
+	if len(args) == 0 {
+		return cmdSkillHelp()
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	switch sub {
+	case "list":
+		remote := false
+		for _, a := range args[1:] {
+			if a == "--remote" || a == "-r" {
+				remote = true
+				break
+			}
+		}
+		if remote {
+			entries, err := skill.FetchRegistry()
+			if err != nil {
+				return fmt.Sprintf("拉取注册表失败：%v\n请配置环境变量 WILL_SKILLS_REGISTRY_URL。", err)
+			}
+			if len(entries) == 0 {
+				return "注册表为空。"
+			}
+			var b strings.Builder
+			b.WriteString("可安装的 Skill（使用 /skill install <名称> 安装）：\n")
+			for _, e := range entries {
+				b.WriteString(fmt.Sprintf("- %s — %s\n", e.Name, e.Description))
+			}
+			return strings.TrimRight(b.String(), "\n")
+		}
+		return cmdSkills()
+	case "install":
+		nameOrURL := strings.TrimSpace(strings.Join(args[1:], " "))
+		if nameOrURL == "" {
+			return "用法：/skill install <名称或链接>"
+		}
+		if strings.HasPrefix(nameOrURL, "http://") || strings.HasPrefix(nameOrURL, "https://") {
+			dir, err := skill.InstallFromURL(nameOrURL, "")
+			if err != nil {
+				return "安装失败：" + err.Error()
+			}
+			return fmt.Sprintf("已从链接安装到 %s", dir)
+		}
+		entries, err := skill.FetchRegistry()
+		if err != nil {
+			return fmt.Sprintf("拉取注册表失败：%v", err)
+		}
+		for _, e := range entries {
+			if e.Name == nameOrURL {
+				dir, err := skill.InstallFromURL(e.URL, e.Name)
+				if err != nil {
+					return fmt.Sprintf("安装 %s 失败：%v", nameOrURL, err)
+				}
+				return fmt.Sprintf("已安装 %s 到 %s", nameOrURL, dir)
+			}
+		}
+		return fmt.Sprintf("注册表中未找到「%s」。请先用 /skill list --remote 查看可用列表，或用 /skill install <完整链接> 直接安装。", nameOrURL)
+	case "prepare":
+		name := strings.TrimSpace(strings.Join(args[1:], " "))
+		if name == "" {
+			return "用法：/skill prepare <名称>"
+		}
+		if err := skill.Prepare(name); err != nil {
+			return "prepare 失败：" + err.Error()
+		}
+		return fmt.Sprintf("已为 %s 安装依赖。", name)
+	case "update":
+		entries, err := skill.FetchRegistry()
+		if err != nil {
+			return fmt.Sprintf("拉取注册表失败：%v", err)
+		}
+		installed := skill.LoadAll("")
+		var updated []string
+		for _, e := range entries {
+			for _, s := range installed {
+				if s.Name == e.Name {
+					_, err := skill.InstallFromURL(e.URL, e.Name)
+					if err != nil {
+						continue
+					}
+					updated = append(updated, e.Name)
+					break
+				}
+			}
+		}
+		if len(updated) == 0 {
+			return "没有可从注册表更新的 Skill。"
+		}
+		return fmt.Sprintf("已更新 %d 个 Skill：%s", len(updated), strings.Join(updated, "、"))
+	default:
+		return cmdSkillHelp()
+	}
 }
 
 func cmdAllow(arg string, openID string, s *store.Store) string {

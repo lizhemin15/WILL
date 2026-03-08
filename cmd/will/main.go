@@ -60,7 +60,12 @@ func markSeen(id string) bool {
 var Version = "dev"
 
 func main() {
-	dbPath := os.Getenv("WILL_DB") // 可选，如 /opt/will/will.db；空则用 ~/.will/will.db
+	if len(os.Args) >= 2 && (os.Args[1] == "skill" || os.Args[1] == "skills") {
+		runSkillCLI()
+		return
+	}
+
+	dbPath := os.Getenv("WILL_DB") // 可选，如 /opt/will/will.db；空则用 will.db
 	s, err := store.Open(dbPath)
 	if err != nil {
 		log.Fatalf("打开数据库失败: %v", err)
@@ -154,6 +159,12 @@ func processFeishuMessage(s *store.Store, cfg *config.Config, openID, text, mess
 
 	// 待确认配置变更拦截
 	if rpl, ok := handlePendingConfigConfirm(s, openID, strings.TrimSpace(text)); ok {
+		reply, sendReply = rpl, true
+		goto done
+	}
+
+	// 待确认 Skill 敏感操作拦截
+	if rpl, ok := handlePendingSkillConfirm(s, openID, strings.TrimSpace(text)); ok {
 		reply, sendReply = rpl, true
 		goto done
 	}
@@ -476,6 +487,43 @@ func executeTool(s *store.Store, cfg *config.Config, openID string, loc *time.Lo
 		}
 		return fmt.Sprintf("已向从节点「%s」发送升级指令，升级完成后将自动重连。", p.WorkerName)
 
+	case "skill_list_local":
+		return bot.SkillRun([]string{"list"})
+
+	case "skill_list_remote":
+		return bot.SkillRun([]string{"list", "--remote"})
+
+	case "skill_install":
+		var p struct {
+			NameOrURL string `json:"name_or_url"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		nameOrURL := strings.TrimSpace(p.NameOrURL)
+		if nameOrURL == "" {
+			return "请提供要安装的 Skill 名称或下载链接。"
+		}
+		pending, _ := json.Marshal(map[string]string{"action": "install", "name_or_url": nameOrURL})
+		_ = s.SetMemory("user:"+openID, llm.PendingSkillKey, string(pending))
+		return fmt.Sprintf("将安装 Skill：%s。请回复「确认」执行，或「取消」放弃。", nameOrURL)
+
+	case "skill_prepare":
+		var p struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(argsJSON, &p)
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			return "请提供要准备依赖的 Skill 名称。"
+		}
+		pending, _ := json.Marshal(map[string]string{"action": "prepare", "name": name})
+		_ = s.SetMemory("user:"+openID, llm.PendingSkillKey, string(pending))
+		return fmt.Sprintf("将为 Skill「%s」安装依赖（如 brew）。请回复「确认」执行，或「取消」放弃。", name)
+
+	case "skill_update":
+		pending, _ := json.Marshal(map[string]string{"action": "update"})
+		_ = s.SetMemory("user:"+openID, llm.PendingSkillKey, string(pending))
+		return "将从注册表批量更新已安装的 Skill。请回复「确认」执行，或「取消」放弃。"
+
 	default:
 		return fmt.Sprintf("未知工具: %s", name)
 	}
@@ -546,6 +594,47 @@ func handlePendingConfigConfirm(s *store.Store, openID, text string) (reply stri
 		if strings.Contains(lower, w) {
 			_ = s.DeleteMemory(scope, llm.PendingConfigKey)
 			return "已取消配置变更。", true
+		}
+	}
+	return "", false
+}
+
+func handlePendingSkillConfirm(s *store.Store, openID, text string) (reply string, handled bool) {
+	scope := "user:" + openID
+	pendingJSON, ok := s.GetMemory(scope, llm.PendingSkillKey)
+	if !ok || pendingJSON == "" {
+		return "", false
+	}
+	lower := strings.ToLower(strings.TrimSpace(text))
+	confirmWords := []string{"确认", "确定", "好的", "ok", "yes", "是", "同意"}
+	cancelWords := []string{"取消", "不", "no", "否", "算了", "不要", "不用"}
+	for _, w := range cancelWords {
+		if strings.Contains(lower, w) {
+			_ = s.DeleteMemory(scope, llm.PendingSkillKey)
+			return "已取消。", true
+		}
+	}
+	for _, w := range confirmWords {
+		if strings.Contains(lower, w) {
+			var pending struct {
+				Action    string `json:"action"`
+				NameOrURL string `json:"name_or_url"`
+				Name      string `json:"name"`
+			}
+			_ = json.Unmarshal([]byte(pendingJSON), &pending)
+			_ = s.DeleteMemory(scope, llm.PendingSkillKey)
+			var args []string
+			switch pending.Action {
+			case "install":
+				args = []string{"install", strings.TrimSpace(pending.NameOrURL)}
+			case "prepare":
+				args = []string{"prepare", strings.TrimSpace(pending.Name)}
+			case "update":
+				args = []string{"update"}
+			default:
+				return "未知操作，已清除。", true
+			}
+			return bot.SkillRun(args), true
 		}
 	}
 	return "", false

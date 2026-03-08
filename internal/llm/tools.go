@@ -179,6 +179,50 @@ var toolDefs = []map[string]interface{}{
 			}, "worker_name"),
 		},
 	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "skill_list_local",
+			"description": "列出当前已加载的 Skill（含未就绪的及原因）。用户说「有哪些 skill」「已安装的技能」「技能列表」时使用",
+			"parameters":  emptyParams(),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "skill_list_remote",
+			"description": "从注册表拉取并列出可安装的 Skill。用户说「可安装的 skill」「从注册表看看」「能装哪些技能」时使用",
+			"parameters":  emptyParams(),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "skill_install",
+			"description": "安装 Skill：从注册表按名称安装，或从 zip/tar.gz 链接直接安装。用户说「安装 skill xxx」「装一个叫 xxx 的技能」「从链接安装」时使用",
+			"parameters": objectParams(map[string]interface{}{
+				"name_or_url": strParam("Skill 名称（从注册表安装）或完整的 http(s) 链接（zip/tar.gz 直接安装）"),
+			}, "name_or_url"),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "skill_prepare",
+			"description": "为指定 Skill 安装依赖（如执行 brew install）。用户说「给 xxx 装依赖」「准备 xxx 环境」「修复 xxx 未就绪」时使用",
+			"parameters": objectParams(map[string]interface{}{
+				"name": strParam("Skill 名称，与 skill_list_local 返回的名称一致"),
+			}, "name"),
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "skill_update",
+			"description": "从注册表批量更新已安装的 Skill。用户说「更新所有 skill」「升级技能」「拉取最新 skill」时使用",
+			"parameters":  emptyParams(),
+		},
+	},
 }
 
 func emptyParams() map[string]interface{} {
